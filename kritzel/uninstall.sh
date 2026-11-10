@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Removes Kritzel again and restores the virtual keyboard that was set before.
-#   ./uninstall.sh            keep ~/.config/kritzel/config.ini
+#   ./uninstall.sh            keep ~/.config/kritzel (settings, personal words)
 #   ./uninstall.sh --purge    remove the settings too
 set -uo pipefail
 
@@ -25,7 +25,8 @@ pkgs=""
 
 # 2. files
 rm -f  "$BIN/kritzel" "$DATA/applications/kritzel.desktop" "$DATA/applications/kritzel-switch.desktop"
-rm -f  "${XDG_RUNTIME_DIR:-/nonexistent}/kritzel.pid"
+rm -f  "$DATA/applications/kritzel-settings.desktop"
+rm -f  "${XDG_RUNTIME_DIR:-/nonexistent}/kritzel.pid" "${XDG_RUNTIME_DIR:-/nonexistent}/kritzel-settings.pid"
 rm -rf "$DATA/kritzel" "$CACHE/kritzel" "$STATE/kritzel"
 [ "$PURGE" = 1 ] && rm -rf "$CONF/kritzel"
 command -v update-desktop-database >/dev/null && update-desktop-database -q "$DATA/applications" 2>/dev/null || true

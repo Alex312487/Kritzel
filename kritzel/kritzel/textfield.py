@@ -17,24 +17,20 @@ log = logging.getLogger("kritzel.textfield")
 
 BACKSPACE = "backspace"
 ENTER = "enter"
-KEYSYMS = {BACKSPACE: 0xFF08, ENTER: 0xFF0D}        # XKB_KEY_BackSpace, XKB_KEY_Return
+ARROWS = ("left", "up", "right", "down")
+KEYSYMS = {BACKSPACE: 0xFF08, ENTER: 0xFF0D,         # XKB_KEY_BackSpace, XKB_KEY_Return
+           "left": 0xFF51, "up": 0xFF52, "right": 0xFF53, "down": 0xFF54,
+           "tab": 0xFF09, "delete": 0xFFFF, "home": 0xFF50, "end": 0xFF57}
 
-NO_SPACE_AFTER = set("([{<\"'/\\@#-_„“‚‘–—")
-NO_SPACE_BEFORE = set(".,;:!?)]}%\"'…’”")
+# content purposes (text-input protocol) of fields that hold no prose:
+# digits, number, phone, url, email, password
+PLAIN_PURPOSES = {2, 3, 4, 5, 6, 8}
+HINT_HIDDEN_TEXT = 0x40
 
 # Applications handle key presses later than input-method text (Qt queues
 # them).  When a correction has to be made with Backspace keys, the new text
 # is therefore held back for this long so that it cannot overtake them.
 KEYS_FIRST_DELAY = 0.15
-
-
-def needs_space(before: str, text: str) -> bool:
-    """Should a space go between the existing text and the new chunk?"""
-    if not before or not text:
-        return False
-    if before[-1].isspace() or before[-1] in NO_SPACE_AFTER:
-        return False
-    return text[0] not in NO_SPACE_BEFORE
 
 
 def last_word_length(before: str) -> int:
@@ -61,6 +57,7 @@ class TextField:
         self._reported = None           # text before the cursor as reported by the app
         self._reports_text = False      # the app has reported real text at least once
         self._held_back = None          # text waiting for Backspace keys to be handled
+        self.plain = False              # the field holds no prose (address, number, password)
 
     # -- focus -------------------------------------------------------------
 
@@ -76,6 +73,8 @@ class TextField:
         self._tail = ""
         self._reported = None
         self._reports_text = False
+        self.plain = False
+        ctx.dispatcher["content_type"] = self._on_content_type
         ctx.dispatcher["surrounding_text"] = self._on_surrounding_text
         ctx.dispatcher["commit_state"] = self._on_commit_state
         ctx.dispatcher["reset"] = self._on_reset
@@ -105,6 +104,9 @@ class TextField:
             self._reports_text = True
         self._reported = text.encode("utf-8")[:cursor].decode("utf-8", "ignore") if self._reports_text else None
         self.on_state()
+
+    def _on_content_type(self, _ctx, hint, purpose):
+        self.plain = purpose in PLAIN_PURPOSES or bool(hint & HINT_HIDDEN_TEXT)
 
     def _on_commit_state(self, _ctx, serial):
         self.serial = serial
@@ -137,7 +139,7 @@ class TextField:
             self.ctx.commit_string(self.serial, text)
 
     def key(self, name: str):
-        """Press and release Backspace or Enter.
+        """Press and release Backspace, Enter or an arrow key.
 
         Sent as key *symbols*, like Plasma's own keyboard does: KWin 6.8
         ignores raw key codes from an input method without a keyboard grab."""
@@ -153,6 +155,12 @@ class TextField:
             self._tail = self._tail[:-1]
         else:
             self._tail = ""
+        self._reported = None
+
+    def changed_behind_our_back(self):
+        """Something we cannot follow changed the text (a paste, say): what
+        we believed to be before the cursor is no longer true."""
+        self._tail = ""
         self._reported = None
 
     def backspace(self, count: int):
@@ -197,6 +205,7 @@ class PreviewField:
     panel and copies it to the clipboard."""
 
     replace_with_keys = False
+    plain = False
 
     def __init__(self):
         self.text = ""
@@ -215,8 +224,14 @@ class PreviewField:
         self._copy()
 
     def key(self, name: str):
-        self.text = self.text[:-1] if name == BACKSPACE else ""
-        self._copy()
+        if name == BACKSPACE:
+            self.text = self.text[:-1]
+        elif name == ENTER:
+            self.text = ""
+        self._copy()                    # the other keys do nothing here
+
+    def changed_behind_our_back(self):
+        pass
 
     def backspace(self, count: int):
         self.text = self.text[: max(0, len(self.text) - count)]

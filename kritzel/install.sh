@@ -7,7 +7,8 @@
 #                                            Plasma's virtual keyboard
 #   ~/.local/share/applications/kritzel-switch.desktop   launcher that toggles
 #                                            handwriting / normal keyboard
-#   ~/.config/kritzel/config.ini             settings (kept on reinstall)
+#   ~/.local/share/applications/kritzel-settings.desktop   the settings window
+#   ~/.config/kritzel/                       settings and personal words (kept on reinstall)
 #
 # The only system change is installing up to three Fedora packages if they
 # are missing (asked first).  ./uninstall.sh reverts everything.
@@ -27,7 +28,7 @@ for arg in "$@"; do
         -y|--yes) ASSUME_YES=1 ;;
         --no-enable) ENABLE=no ;;
         --enable) ENABLE=yes ;;
-        -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; echo; echo "Options: --yes (no questions), --enable / --no-enable"; exit 0 ;;
+        -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; echo; echo "Options: --yes (no questions), --enable / --no-enable"; exit 0 ;;
         *) echo "unknown option: $arg" >&2; exit 2 ;;
     esac
 done
@@ -86,6 +87,7 @@ chmod +x "$BIN/kritzel"
 sed "s|@EXEC@|$BIN/kritzel|" "$SRC/data/kritzel.desktop.in" > "$DATA/applications/kritzel.desktop"
 # launcher "Handwriting / Keyboard": toggles between Kritzel and the normal keyboard
 sed "s|@EXEC@|$BIN/kritzel|" "$SRC/data/kritzel-switch.desktop.in" > "$DATA/applications/kritzel-switch.desktop"
+sed "s|@EXEC@|$BIN/kritzel|" "$SRC/data/kritzel-settings.desktop.in" > "$DATA/applications/kritzel-settings.desktop"
 [ -f "$CONF/kritzel/config.ini" ] || cp "$SRC/data/config.ini" "$CONF/kritzel/config.ini"
 command -v update-desktop-database >/dev/null && update-desktop-database -q "$DATA/applications" 2>/dev/null || true
 command -v kbuildsycoca6 >/dev/null && kbuildsycoca6 >/dev/null 2>&1 || true

@@ -130,9 +130,16 @@ def write(word, font="futural", x0=60.0):
         for p in pts[1:]:
             fake.touch_motion(0, *p); fake.touch_frame()
         pump(); fake.touch_up(0); fake.touch_frame(); pump(0.03)
+# where the keys are: ask the program's own layout code
+sys.path.insert(0, os.environ["ROOT"]); os.environ["QT_QPA_PLATFORM"] = "offscreen"
+from kritzel import ui as kui
+from kritzel.config import Config as KConfig, Theme as KTheme
+def view(page=kui.WRITE):
+    v = kui.View(KTheme(), KConfig(os.devnull)); v.layout(panel_w[0], 280); v.show_page(page); return v
 def btn(name):
-    r, c = {"backspace": (0, 0), "enter": (0, 1), "delword": (2, 0), "keyboard": (2, 1), "float": (3, 0), "hide": (3, 1)}[name]
-    return origin[0] + panel_w[0] - 142 + 6 + 31 + 68 * c, origin[1] + 6 + r * 68.5 + 31
+    c = view().buttons[name].center(); return origin[0] + c.x(), origin[1] + c.y()
+def symbol(text):
+    c = next(k.rect for k in view(kui.SYMBOLS).page_keys if k.text == text).center(); return origin[0] + c.x(), origin[1] + c.y()
 def commits(): return [e[1] for e in log if e[0] == "commit"]
 
 print("vk available:", vk("available"), "active:", vk("active"), "visible:", vk("visible"), flush=True)
@@ -140,31 +147,54 @@ tap(300, 200); pump(1.0)                      # touch the "text field"
 check("text-input focus reached the app", state["ti_enter"])
 check("panel shown after touching the text field", "true" in vk("visible"), vk("visible"))
 
+# a text field reached with mouse or keyboard must not bring the panel up
+ti.disable(); ti.commit(); pump(0.6)
+fake.pointer_motion_absolute(400, 200); fake.button(0x110, 1); fake.button(0x110, 0); pump(0.2)
+sync_ti(True); pump(1.2)
+check("a text field clicked with the mouse does not show the panel", "false" in vk("visible"), vk("visible"))
+tap(300, 200); pump(1.0)
+check("tapping that same field with a finger shows it", "true" in vk("visible"), vk("visible"))
+ti.disable(); ti.commit(); pump(0.6)
+fake.keyboard_key(15, 1); fake.keyboard_key(15, 0); pump(0.2)
+sync_ti(True); pump(1.2)
+check("a text field reached with the keyboard does not show the panel", "false" in vk("visible"), vk("visible"))
+tap(300, 200); pump(1.0)
+check("and a tap shows it again", "true" in vk("visible"), vk("visible"))
+
 write("hello world"); pump(4.0)
-check("handwriting committed", ("commit", "hello world") in log, repr(log[-3:]))
+check("handwriting committed", ("commit", "hello world ") in log, repr(log[-3:]))
 write("again"); pump(2.2)
-check("second chunk gets a leading space", text == "hello world again", repr(text))
+check("each chunk is followed by a space, none is put in front", text == "hello world again ", repr(text))
 
 # alternatives: tap the second suggestion chip (to the right of the first one)
 before = text
 tap(6 + 70 + 6 + 30, H - 280 + 22); pump(0.6)
-check("suggestion replaces the word (delete + insert through text-input)", ("delete", len(" again")) in log and text != before and text.startswith("hello world ") and not [e for e in log if e[0] == "key"], repr(text))
+check("suggestion replaces the word (delete + insert through text-input)", ("delete", len(" again ")) in log and text != before and text.endswith(" ") and text.startswith("hello world ") and not [e for e in log if e[0] == "key" and e[1] == 14], repr(text))
 
 # the same in an application that does not report its text: Backspace keys, then the new text
 state["mute"] = True; t0 = text
 write("again"); pump(2.2)
-check("second word typed", text == t0 + " again", repr(text))
+check("second word typed", text == t0 + "again ", repr(text))
 tap(6 + 70 + 6 + 30, H - 280 + 22); pump(0.8)
 bs = [e for e in log if e[0] == "key" and e[1] == 14 and e[2] == 1]
-check("suggestion replaces the word (keys first, then the text)", len(bs) == len(" again") and text.startswith(t0 + " ") and text != t0 + " again" and len(text) > len(t0) + 2, repr(text))
+check("suggestion replaces the word (keys first, then the text)", len(bs) in (len("again "), len(" again ")) and text.startswith(t0[:-1]) and text != t0 + "again " and text.endswith(" ") and len(text) > len(t0) + 2, repr(text))
 state["mute"] = False; sync_ti(); pump(0.2)
 
 nkeys = len([e for e in log if e[0] == "key"])
-bx = W - 142 + 6 + 31                           # centre of the backspace button
-tap(bx, H - 280 + 6 + 40); pump(0.4)
+tap(*btn("backspace")); pump(0.4)
 check("backspace button sends a key", len([e for e in log if e[0] == "key"]) == nkeys + 2 and log[-2][:2] == ("key", 14), repr(log[-2:]))
+for name, code in (("left", 105), ("right", 106), ("up", 103), ("down", 108)):
+    tap(*btn(name)); pump(0.4)
+    check(f"arrow button {name} reaches the application as a key", log[-2:] == [("key", code, 1), ("key", code, 0)], repr(log[-2:]))
 t_before = text
-write("ok"); tap(bx + 68, H - 280 + 6 + 40); pump(2.0)      # write, then tap Enter before the timer fires
+tap(*btn("symbols")); pump(0.4); tap(*symbol("?")); pump(0.5); tap(*symbol("7")); pump(0.5); tap(*btn("symbols")); pump(0.4)
+check("symbol keyboard types its characters", text == t_before + "?7", repr(text))
+nlog = len(log); tap(*btn("copy")); pump(0.5); tap(*btn("paste")); pump(0.5)
+pressed = [e[1:] for e in log[nlog:] if e[0] == "key"]
+check("copy and paste reach the application as Ctrl+Insert and Shift+Insert",
+      pressed == [(29, 1), (110, 1), (110, 0), (29, 0), (42, 1), (110, 1), (110, 0), (42, 0)], repr(pressed))
+t_before = text
+write("ok"); tap(*btn("enter")); pump(2.0)                  # write, then tap Enter before the timer fires
 check("enter flushes pending ink first", text.endswith("\n") and len(text) > len(t_before) + 1, repr(text))
 
 tap(*btn("hide")); pump(0.8)
@@ -191,7 +221,7 @@ check("mouse drawing works too", len(cm) == n0 + 1 and cm[-1][1].strip() == "mou
 import re
 t0 = text
 tap(*btn("delword")); pump(0.6)
-check("word button removes the last insertion", text == t0[:-len("mouse")], repr(text))
+check("word button removes the last insertion", text == t0[:-len("mouse ")], repr(text))
 t1 = text
 tap(*btn("delword")); pump(0.6)
 check("word button removes the previous word", text == re.sub(r"\w+\s*$", "", t1) and text != t1, repr(text))
@@ -240,6 +270,24 @@ origin[:] = [0.0, H - 280.0]; panel_w[0] = float(W)
 check("docked again", "true" in vk("visible"), vk("visible"))
 n0 = len(commits()); write("docked"); pump(2.2)
 check("writing after docking again", len(commits()) == n0 + 1 and commits()[-1].strip() == "docked", repr(commits()[-1:]))
+
+if os.environ.get("IT_ENABLE"):
+    # `kritzel show` for a text field that was reached with the mouse: this KWin refuses
+    # to display a docked panel then, so the panel has to come up floating
+    ti.disable(); ti.commit(); pump(0.6)
+    fake.pointer_motion_absolute(400, 200); fake.button(0x110, 1); fake.button(0x110, 0); pump(0.2)
+    sync_ti(True); pump(1.2)
+    check("mouse focus after docking: still no panel", "false" in vk("visible"), vk("visible"))
+    r = subprocess.run(os.environ["IT_ENABLE"].split() + ["show"], capture_output=True, text=True); pump(2.0)
+    if "true" in vk("visible"):
+        print("INFO this KWin displays the docked panel on `kritzel show`")
+    else:
+        origin[:] = [(W - 760) // 2 - 100 + 150, H - 280 - 48 - 200 + 120]; panel_w[0] = 760.0     # where it floated before
+        n0 = len(commits()); write("shown"); pump(2.2)
+        check("`kritzel show` after mouse focus: the panel floats", len(commits()) == n0 + 1 and commits()[-1].strip() == "shown", repr(commits()[-1:]))
+        tap(*btn("float")); pump(1.2)
+        origin[:] = [0.0, H - 280.0]; panel_w[0] = float(W)
+        check("docked again by a finger tap", "true" in vk("visible"), vk("visible"))
 
 if os.environ.get("IT_ENABLE"):
     def kread():

@@ -19,6 +19,7 @@ WANTED = {
     "wp_cursor_shape_manager_v1": 1,
     "xdg_wm_base": 1,
     "zwlr_layer_shell_v1": 1,
+    "org_kde_kwin_fake_input": 4,
 }
 INPUT_METHOD = ("zwp_input_method_v1", "zwp_input_panel_v1")
 

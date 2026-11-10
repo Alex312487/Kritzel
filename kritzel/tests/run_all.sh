@@ -4,10 +4,13 @@
 #
 #   test_units.py   pure logic, no compositor
 #   it_pen.py       the real program against a scripted compositor (mockcomp.py):
-#                   pen, eraser, palm, scaling, floating, suggestions
+#                   pen, eraser, palm, scaling, floating, suggestions, spaces,
+#                   every kind of key, symbol keyboard, language list, applying
+#                   changed settings; IT_RESTORE: starting up floating
 #   run_it.sh       the real program inside a headless KWin, with a fake text
 #                   application (it_kwin.py) and injected touch / mouse input
 #
+# The settings window is only checked for starting up.
 # The KWin test was written against KWin 5.27, the only version available
 # where it was developed.  Two KWin 5 quirks are worked around with
 # KRITZEL_LAYER_SCOPE=dock (see surface.py) for the floating tests; without it
@@ -20,6 +23,7 @@ run "$PY" tests/test_units.py
 run "$PY" tests/it_pen.py
 IT_SCALE=2 run "$PY" tests/it_pen.py
 IT_NOFRAC=1 run "$PY" tests/it_pen.py
+IT_RESTORE=1 run "$PY" tests/it_pen.py
 if command -v "${KWIN:-kwin_wayland}" >/dev/null; then
     run tests/run_it.sh
     KRITZEL_LAYER_SCOPE=dock run tests/run_it.sh

@@ -3,7 +3,8 @@
 One PanelSurface can appear in three ways:
 
   docked    an input-panel surface (zwp_input_panel_v1).  KWin puts it at the
-            bottom of the screen and makes room for it above.
+            bottom of the screen and makes room for it above.  It exists
+            only while the panel is shown (see _create_dock).
   floating  a layer-shell surface that never takes the keyboard focus and is
             positioned through its top/left margins, which is what lets the
             user drag it around.
@@ -99,17 +100,15 @@ class PanelSurface:
         self._move_unconfirmed = False
         self._move_cb = None
 
-        self.surface, self.viewport = self._new_wl_surface()
-        self._dock = (self.surface, self.viewport)
         if window:
+            self.surface, self.viewport, _ = self._new_wl_surface()
             self._configured = False
             self._become_window()
         else:
             self._configured = True
+            self._dock = None               # (surface, viewport, scale listener) while docked and shown
+            self.surface = self.viewport = None
             session.wait_for_output()
-            out = session.first_output()
-            self._role = self.g["zwp_input_panel_v1"].get_input_panel_surface(self.surface)
-            self._role.set_toplevel(out.obj if out else None, 0)        # 0 = centred at the bottom
         session.on_outputs_changed = self._resize
         session.conn.roundtrip()
         self._resize(force=True)
@@ -136,6 +135,8 @@ class PanelSurface:
         visible = visible and self._configured
         if visible and (not self.mapped or force):
             log.debug("showing panel")
+            if self.surface is None:
+                self._create_dock()
             self.mapped = True
             self._frame_pending = False
             self._image_stale = True
@@ -153,18 +154,20 @@ class PanelSurface:
             if self.mapped:
                 self._unmap()
             self.floating = True
-            self.surface = self.viewport = None
             self._configured = False
             log.info("floating mode")
         else:
             self._destroy_float()
             self.floating = False
-            self.surface, self.viewport = self._dock
             self._configured = True
-            self._resize(force=True)
             log.info("docked mode")
         self.set_visible(self._want_visible)
         return True
+
+    def apply_config(self, cfg):
+        """The settings changed: the panel may have a new size."""
+        self.cfg = cfg
+        self._resize()
 
     def redraw(self):
         """The panel's content changed: repaint all of it."""
@@ -228,16 +231,45 @@ class PanelSurface:
     # ------------------------------------------------------------------
 
     def _new_wl_surface(self):
+        """Returns (surface, viewport, scale listener); the last two are None
+        if the compositor has no fractional scaling."""
         surface = self.g["wl_compositor"].create_surface()
         surface.dispatcher["enter"] = self._on_enter
         surface.dispatcher["leave"] = self._on_leave
-        viewport = None
-        self._scale_listener = None
+        viewport = listener = None
         if self.session.has("wp_viewporter", "wp_fractional_scale_manager_v1"):
             viewport = self.g["wp_viewporter"].get_viewport(surface)
-            self._scale_listener = self.g["wp_fractional_scale_manager_v1"].get_fractional_scale(surface)
-            self._scale_listener.dispatcher["preferred_scale"] = self._on_preferred_scale
-        return surface, viewport
+            listener = self.g["wp_fractional_scale_manager_v1"].get_fractional_scale(surface)
+            listener.dispatcher["preferred_scale"] = self._on_preferred_scale
+        return surface, viewport, listener
+
+    def _create_dock(self):
+        """Creates the docked surface, at the moment the panel is to be shown.
+
+        KWin decides by itself whether a docked panel is displayed: only if
+        the user's last action was done with a finger or the pen, so that a
+        text field reached with mouse or keyboard does not bring it up.  It
+        settles that when it first sees the surface and then keeps
+        displaying that same surface for every later text field.  Therefore
+        every showing gets a new surface, and hiding destroys it.  (Qt-based
+        keyboards do the same without knowing it: Qt destroys the surface of
+        a hidden window.)"""
+        self._dock = self._new_wl_surface()
+        self.surface, self.viewport, _ = self._dock
+        out = self.session.first_output()
+        role = self.g["zwp_input_panel_v1"].get_input_panel_surface(self.surface)
+        role.set_toplevel(out.obj if out else None, 0)          # 0 = centred at the bottom
+        self._entered = []
+        self._resize(force=True)
+
+    def _destroy_dock(self):
+        surface, viewport, listener = self._dock
+        for obj in (listener, viewport, surface):
+            if obj is not None:
+                obj.destroy()
+        self._dock = None
+        self.surface = self.viewport = None
+        self._entered = []
 
     def _become_window(self):
         if "xdg_wm_base" not in self.g:
@@ -281,9 +313,12 @@ class PanelSurface:
         self.mapped = False
         self._frame_pending = False
         self.loop.cancel_timer("frame-watchdog")
-        self.surface.attach(None, 0, 0)
-        self.surface.commit()
         self._drop_buffers()            # no need to keep pixel memory while hidden
+        if self.window:
+            self.surface.attach(None, 0, 0)
+            self.surface.commit()
+        else:
+            self._destroy_dock()
         self.on_gone()
 
     def _drop_buffers(self):
@@ -294,7 +329,7 @@ class PanelSurface:
     # -- floating ------------------------------------------------------
 
     def _create_float(self):
-        surface, viewport = self._new_wl_surface()
+        surface, viewport, listener = self._new_wl_surface()
         w, h = self._float_size()
         self.float_pos = self._clamp(self.float_pos)
         # KWin 5 gives the focus to any touched layer surface except docks;
@@ -310,7 +345,7 @@ class PanelSurface:
         layer.dispatcher["closed"] = lambda *_: self._float_failed("closed by the compositor")
         surface.commit()
         self._layer = layer
-        self._float_objs = [o for o in (viewport, self._scale_listener, surface) if o is not None]
+        self._float_objs = [o for o in (viewport, listener, surface) if o is not None]
         self.surface, self.viewport = surface, viewport
         self._configured = False
         self.mapped = False

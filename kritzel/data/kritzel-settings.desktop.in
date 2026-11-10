@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Kritzel Settings
+Name[de]=Kritzel-Einstellungen
+GenericName=Handwriting panel settings
+GenericName[de]=Einstellungen der Handschrift-Eingabe
+Comment=Languages, personal words and behaviour of the Kritzel handwriting panel
+Comment[de]=Sprachen, eigene Wörter und Verhalten der Kritzel-Handschrifteingabe
+Exec=@EXEC@ settings
+Icon=draw-freehand
+Categories=Settings;Utility;

@@ -14,7 +14,8 @@ EOF
 chmod +x "$T/kritzel"
 printf '[Desktop Entry]\nType=Application\nName=Kritzel\nExec=%s\nX-KDE-Wayland-VirtualKeyboard=true\n' "$T/kritzel" > "$XDG_DATA_HOME/applications/kritzel.desktop"
 printf '[Desktop Entry]\nType=Application\nName=Fake Plasma Keyboard\nExec=/bin/sleep 600\nX-KDE-Wayland-VirtualKeyboard=true\n' > "$XDG_DATA_HOME/applications/org.kde.plasma.keyboard.desktop"
-printf '[recognition]\ndelay_ms=500\n' > "$XDG_CONFIG_HOME/kritzel/config.ini"
+# language_letters=false: with only English letters allowed, the clean test words have no second reading to pick
+printf '[recognition]\ndelay_ms=500\nlanguage_letters=false\n' > "$XDG_CONFIG_HOME/kritzel/config.ini"
 printf '[Wayland]\nVirtualKeyboardEnabled=true\n' > "$XDG_CONFIG_HOME/kwinrc"
 export IT_ENABLE="$T/kritzel"
 [ "${KRITZEL_LAYER_SCOPE:-}" = dock ] && export KRITZEL_TOUCH_DRAG=relative   # KWin 5 quirks

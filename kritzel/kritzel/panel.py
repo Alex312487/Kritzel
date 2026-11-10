@@ -14,7 +14,10 @@ Panel is the conductor.  The parts it conducts:
     devices.InputDevices    mouse, touch and pen -> press / motion / release
     textfield.TextField     the focused text field
     engine.RecognitionWorker  handwriting -> text, on a background thread
-    ui.View                 layout and painting
+    compose                 reading -> typed text (spaces, capitals)
+    languages.LanguageChoice  the language being written
+    fakekeys.FakeKeyboard   copy / cut / paste
+    ui.View                 layout and painting; keys.KEYS says which keys exist
 """
 
 from __future__ import annotations
@@ -22,29 +25,37 @@ from __future__ import annotations
 import logging
 import os
 import signal
+import subprocess
+import sys
 import time
 
 from PyQt6.QtCore import QPointF
 from PyQt6.QtGui import QPainter
 
-from . import kwin
+from . import control, kwin
+from .compose import Context, compose, compose_symbol
 from .compositor import NotInputMethod, Session
-from .config import Config, Theme
+from .config import Config, Theme, load_state, load_words, save_state
 from .devices import InputDevices, is_touch, source_kind
 from .engine import RecognitionWorker
 from .eventloop import Loop
+from .fakekeys import FakeKeyboard
 from .ink import LineScale, Stroke, ink_bounds, render_line
+from .keys import COMMAND, KEY, KEYSYM, SHORTCUT, TEXT
+from .languages import ALL, LanguageChoice
 from .surface import PanelSurface
-from .textfield import BACKSPACE, ENTER, PreviewField, TextField, last_word_length, needs_space
-from .ui import View
+from .textfield import PreviewField, TextField, last_word_length
+from .ui import ALL_LANGUAGES, LANGUAGE, LANGUAGES, MORE_LANGUAGES, SYMBOL, SYMBOLS, WRITE, View
 
 __all__ = ["Panel", "NotInputMethod"]
 
 log = logging.getLogger("kritzel")
 
 ERASER_RADIUS = 9.0
-BACKSPACE_REPEAT_DELAY = 0.45
-BACKSPACE_REPEAT_INTERVAL = 0.07
+REPEAT_DELAY = 0.45
+REPEAT_INTERVAL = 0.07
+SHOW_COMMAND_WINDOW = 1.0            # see show_now()
+DISPLAY_CHECK_DELAY = 0.5            # see _insist_on_being_displayed()
 FOCUS_THEFT_WINDOW = 0.15       # see _focus_was_stolen()
 # KWin 5 reports touch positions like pointer positions (see PanelSurface.drag);
 # only the test-suite, which runs against KWin 5, sets this.
@@ -54,10 +65,14 @@ KWIN5_TOUCH_DRAG = os.environ.get("KRITZEL_TOUCH_DRAG") == "relative"
 class Insertion:
     """The text the panel typed last, so that it can be swapped or undone."""
 
-    def __init__(self, text: str, prefix: str):
-        self.text = text            # everything that was typed, including the prefix
-        self.prefix = prefix        # the automatic space in front, or ""
-        self.seen_in_field = False  # the application has reported it back
+    def __init__(self, span: str, own_length: int, context: Context, trailing_space: bool):
+        self.span = span                    # the text before the cursor that a swap replaces
+        self.own_length = own_length        # how much of it this insertion typed; the rest is
+        #                                     the automatic space of the insertion before
+        self.context = context              # the text field before it; another reading is
+        #                                     composed for the same situation
+        self.trailing_space = trailing_space    # it ends with an automatic space
+        self.seen_in_field = False          # the application has reported it back
 
 
 class Panel:
@@ -66,19 +81,20 @@ class Panel:
         self.window_mode = window_mode
         self.loop = Loop()
         self.theme = Theme()
-        self.view = View(self.theme, cfg.pen_width)
+        self.view = View(self.theme, cfg)
 
         # -- what the view paints (see ui.View.paint) --
         self.strokes: list[Stroke] = []         # finished strokes not yet recognised
         self.candidates: list[str] = []         # suggestion chips
         self.selected = -1                      # index of the chip that is in the text field
         self.status = ""                        # short message at the right of the bar
-        self.pressed = None                     # name of the button held down
+        self.pressed = None                     # name of the key held down
         self.hint = "Write here"
 
         # -- ink and recognition --
         self.current: Stroke | None = None      # the stroke being drawn
-        self.linescale = LineScale(cfg.height)
+        self._linescale_area = (self.view.canvas.top(), self.view.canvas.height())
+        self.linescale = LineScale(*self._linescale_area)
         self.generation = 0                     # bumped whenever the ink changes
         self.recognizing = False
         self.last: Insertion | None = None
@@ -88,9 +104,13 @@ class Panel:
         #    "draw", "erase", "button", "chip", "move" --
         self.gesture = None
 
+        self.languages = LanguageChoice(cfg)    # which dictionary judges the readings
+        self.settings_window = None             # the settings program, while we started it
+
         # -- visibility --
         self.user_hidden = False                # the hide button was pressed
-        self.float_allowed = False              # floating: KWin would show a keyboard now
+        self.float_allowed = False              # floating: the text field was tapped with finger or pen
+        self.shown_by_command_at = -10.0        # `kritzel show`
         self.float_broken = False               # floating does not work with this compositor
         self.focus_thefts = 0
         self.deactivated_at = 0.0
@@ -104,8 +124,11 @@ class Panel:
             self.session, self.loop, cfg, window_mode,
             paint=self._paint, on_layout=self._on_layout, on_close=self.loop.stop,
             on_float_lost=self._on_float_lost, on_gone=self._on_surface_gone)
-        self.devices = InputDevices(self.session, sink=self, palm_zone=self.view.in_canvas)
-        self.worker = RecognitionWorker(cfg, self.loop, self._on_model_ready, self._on_model_error, self._on_result)
+        self.devices = InputDevices(self.session, sink=self, writing_area=self.view.in_canvas, cfg=cfg)
+        self.fake_keyboard = FakeKeyboard(self.session)
+        self.worker = RecognitionWorker(cfg, self.loop, self._on_model_ready, self._on_model_error, self._on_result,
+                                        languages=self.languages.active(), personal=load_words())
+        self._restore_floating()
         if not window_mode:
             im = self.session.g["zwp_input_method_v1"]
             im.dispatcher["activate"] = self._on_activate
@@ -136,15 +159,37 @@ class Panel:
             conn.flush()
 
         signal.signal(signal.SIGUSR1, lambda *_: self.loop.call_soon_threadsafe(self.show_now))
+        signal.signal(signal.SIGHUP, lambda *_: self.loop.call_soon_threadsafe(self.reload_settings))
         self.loop.add_reader(conn.fileno(), on_readable)
         self.loop.add_idle(before_sleeping)
         self.loop.run()
 
     def show_now(self):
-        """`kritzel show`."""
+        """`kritzel show`: the command has also asked KWin to activate the
+        keyboard, which may reach us before or after this."""
         self.user_hidden = False
         self.float_allowed = True
+        self.shown_by_command_at = time.monotonic()
         self._update_visibility()
+        self._insist_on_being_displayed()
+
+    def reload_settings(self):
+        """`kritzel reload`, or Apply in the settings window."""
+        log.info("reloading settings")
+        self.cfg = cfg = Config()
+        self.field.replace_with_keys = cfg.replace == "keys"
+        self.view.configure(cfg)
+        self._show_page(WRITE)
+        self.devices.configure(cfg)
+        self.languages.update(cfg)
+        self.worker.configure(cfg, self.languages.active(), load_words())
+        if self.worker.ready:
+            self.status = ""
+        self.surface.apply_config(cfg)
+        if self.surface.floating and not self.view.has_key("float"):
+            self._toggle_float()            # the key that would dock it again is gone
+        self._update_visibility()
+        self.redraw()
 
     # ------------------------------------------------------------------
     # Painting
@@ -161,26 +206,38 @@ class Panel:
             p.drawPath(self.current.path())
 
     def _on_layout(self, w: int, h: int):
-        old_h = self.view.h
         self.view.layout(w, h)
-        if abs(old_h - h) > 1 and not self.strokes:
-            self.linescale.reset(self.view.canvas.height())
-            self.linescale.top += self.view.canvas.top()
-            self.linescale.bottom += self.view.canvas.top()
+        self._fit_linescale()
+
+    def _fit_linescale(self):
+        """The writing area moved or changed its height: what was learnt
+        about the user's line no longer applies."""
+        area = (self.view.canvas.top(), self.view.canvas.height())
+        if self.view.page == WRITE and area != self._linescale_area and not self.strokes:
+            self._linescale_area = area
+            self.linescale.reset(*area)
 
     # ------------------------------------------------------------------
     # Visibility
     # ------------------------------------------------------------------
 
     def _update_visibility(self):
+        """The panel is for fingers and pens: it appears when a text field
+        is tapped, not when one is clicked with the mouse or typed into.
+
+        For the docked panel KWin applies that rule itself; mapping the
+        surface only means "ready to be displayed" (but see
+        PanelSurface._create_dock).  A floating panel is an ordinary
+        overlay as far as KWin is concerned, so it has to ask KWin what the
+        user did last."""
         if self.window_mode:
             visible = True
         elif not self.field.active or self.user_hidden:
             visible = False
+        elif self.surface.floating:
+            visible = self.float_allowed or self.cfg.show == "always"
         else:
-            # KWin itself decides whether the docked panel is displayed (not
-            # while typing on a physical keyboard); a floating one has to ask.
-            visible = self.float_allowed if self.surface.floating else True
+            visible = True
         self.surface.set_visible(visible)
 
     def _on_activate(self, _im, ctx):
@@ -189,10 +246,16 @@ class Panel:
         self._forget_last()
         if self.theme.changed():
             self.theme.reload()
+        by_command = time.monotonic() - self.shown_by_command_at < SHOW_COMMAND_WINDOW
         if self.surface.floating:
-            self.float_allowed = False
+            self.float_allowed = by_command
             self._ask_kwin()
         self._update_visibility()
+        if by_command:
+            self._insist_on_being_displayed()
+        elif self.cfg.show == "always":
+            kwin.force_activate_soon()
+            self._insist_on_being_displayed()
         self.redraw()
         log.debug("text field activated")
 
@@ -201,9 +264,34 @@ class Panel:
             self.deactivated_at = time.monotonic()
             self._clear_ink()
             self._forget_last()
+            self._show_page(WRITE)
             self.cancel()
             self._update_visibility()
         log.debug("text field deactivated")
+
+    def _insist_on_being_displayed(self):
+        """For `kritzel show` and the "always" setting, where the panel is
+        wanted although the text field may have been reached with mouse or
+        keyboard.  KWin has been asked to show the keyboard regardless, but
+        only newer versions (6.7?) then display a docked panel.  If this one
+        does not, the panel floats instead: a floating panel is ours to show."""
+        self.loop.set_timer("display-check", DISPLAY_CHECK_DELAY, self._check_displayed)
+
+    def _docked_and_mapped(self) -> bool:
+        return not self.window_mode and not self.surface.floating and self.surface.mapped and self.field.active
+
+    def _check_displayed(self):
+        if self._docked_and_mapped():
+            kwin.ask_visible(self.loop, self._on_displayed_answer, self.field.ctx)
+
+    def _on_displayed_answer(self, displayed: bool, ctx):
+        if displayed or ctx is not self.field.ctx or not self._docked_and_mapped():
+            return
+        if self.float_broken or not self.surface.can_float:
+            return
+        log.info("KWin does not display the docked panel after mouse or keyboard input; floating instead")
+        self._toggle_float()
+        self.redraw()
 
     def _hide(self):
         """Hide button.  The surface is unmapped at once, and KWin is told to
@@ -232,6 +320,7 @@ class Panel:
         # The application re-sent its state, which it also does when the
         # field is tapped again: a floating panel that is not shown asks anew.
         if (self.surface.floating and self.field.active and not self.float_allowed and not self.user_hidden
+                and self.cfg.show != "always"
                 and time.monotonic() - self.asked_kwin_at > 0.3):
             self._ask_kwin()
 
@@ -249,11 +338,41 @@ class Panel:
         self.view.floating = floating
         self.float_allowed = True           # the panel is on screen right now
         self.surface.set_floating(floating)
+        self._remember_floating()
+        if not floating:
+            self._show_docked_again()
+            self._insist_on_being_displayed()   # "dock" clicked with the mouse
+
+    def _remember_floating(self):
+        if self.cfg.remember_floating and not self.window_mode:
+            pos = self.surface.float_pos
+            save_state({**load_state(), "floating": self.surface.floating, "float_pos": list(pos) if pos else None})
+
+    def _restore_floating(self):
+        """Setting "remember floating": start the way the panel was left."""
+        state = load_state()
+        if not (self.cfg.remember_floating and state.get("floating") and self.surface.can_float
+                and self.view.has_key("float") and not self.window_mode):
+            return
+        pos = state.get("float_pos")
+        if isinstance(pos, list) and len(pos) == 2 and all(isinstance(v, (int, float)) for v in pos):
+            self.surface.float_pos = (int(pos[0]), int(pos[1]))
+        self.view.floating = True
+        self.surface.set_floating(True)
+
+    def _show_docked_again(self):
+        """The panel was floating and visible; the docked surface that
+        replaces it is new to KWin, which would only display it after the
+        next tap on a text field."""
+        if self.field.active and not self.user_hidden:
+            kwin.force_activate_soon()
 
     def _on_float_lost(self, _reason: str):
         self._clear_ink()
         self.view.floating = False
         self.status = "floating failed – docked again"
+        self._remember_floating()
+        self._show_docked_again()
         self.redraw()
 
     def _on_surface_gone(self):
@@ -286,20 +405,21 @@ class Panel:
         log.debug("press %s at %.0f,%.0f", source_kind(source), x, y)
         if self.gesture is not None:
             return                          # one finger / pen at a time
-        button = self.view.button_at(x, y)
-        if button:
-            self.gesture = (source, "button", button)
-            self.pressed = button
-            if button == "backspace":       # acts on press and repeats while held
-                self._do_button("backspace")
-                self.loop.set_timer("repeat", BACKSPACE_REPEAT_DELAY, self._repeat_backspace)
+        key = self.view.button_at(x, y)
+        if key:
+            self.gesture = (source, "button", key)
+            self.pressed = key
+            if self._acts_on_press(key):
+                self._do_key(key)
+                if self.cfg.key_repeat:
+                    self.loop.set_timer("repeat", REPEAT_DELAY, self._repeat_key)
             self.redraw()
             return
         chip = self.view.chip_at(x, y)
         if chip:
             self.gesture = (source, "chip", chip.index)
             return
-        if self.surface.floating and self.view.bar.contains(QPointF(x, y)):
+        if self.surface.floating and self.view.in_handle(x, y):
             self.gesture = (source, "move", (x, y))
             self.surface.begin_drag()
             return
@@ -352,12 +472,13 @@ class Panel:
             self._schedule_recognition()
         elif kind == "move":
             self.surface.end_drag()
+            self._remember_floating()
         elif kind == "button":
             self.loop.cancel_timer("repeat")
             hit = self.pressed == data
             self.pressed = None
-            if hit and data != "backspace":
-                self._do_button(data)
+            if hit and not self._acts_on_press(data):
+                self._do_key(data)
             self.redraw()
         elif kind == "chip":
             chip = self.view.chip_at(*self.devices.position_of(source))
@@ -388,39 +509,107 @@ class Panel:
             self.strokes = keep
             self.redraw()
 
-    def _repeat_backspace(self):
-        if self.gesture and self.gesture[1] == "button" and self.pressed == "backspace":
-            self._do_button("backspace")
-            self.loop.set_timer("repeat", BACKSPACE_REPEAT_INTERVAL, self._repeat_backspace)
+    @staticmethod
+    def _acts_on_press(name: str) -> bool:
+        """Backspace and the like act when pressed (and repeat while held);
+        all other keys act when released on them."""
+        return name in KEY and KEY[name].repeats
+
+    def _repeat_key(self):
+        if self.gesture and self.gesture[1] == "button" and self.pressed == self.gesture[2]:
+            self._do_key(self.pressed)
+            self.loop.set_timer("repeat", REPEAT_INTERVAL, self._repeat_key)
 
     # ------------------------------------------------------------------
-    # Buttons
+    # Keys
     # ------------------------------------------------------------------
 
-    def _do_button(self, name: str):
-        if name in ("backspace", "enter", "space") and self._type_pending_ink_then(lambda: self._do_button(name)):
+    def _do_key(self, name: str):
+        """A key was pressed: one of keys.KEYS, a symbol or a language."""
+        if name.startswith(LANGUAGE):
+            self._choose_language(name[len(LANGUAGE):])
+            self.redraw()
             return
-        if name == "backspace":
-            self.field.key(BACKSPACE)
+        kind, argument = (TEXT, name[len(SYMBOL):]) if name.startswith(SYMBOL) else KEY[name].action
+        # whatever a key types comes after the ink that is still waiting
+        if (kind != COMMAND or argument == "symbols") and self._type_pending_ink_then(lambda: self._do_key(name)):
+            return
+        if kind == KEYSYM:
+            self.field.key(argument)
             self._forget_last()
-        elif name == "enter":
-            self.field.key(ENTER)
+        elif kind == SHORTCUT:
+            self._press_shortcut(argument)
+        elif kind == TEXT and name == "space":
+            if not self._context().space_pending:   # the automatic space is the space
+                self.field.commit(" ")
             self._forget_last()
-        elif name == "space":
-            self.field.commit(" ")
+        elif kind == TEXT:
+            context = self._context()
+            self._type(compose_symbol(argument, context, self._auto_space()), context)
             self._forget_last()
-        elif name == "delword":
-            self._delete_word()
-        elif name == "keyboard":
-            self._switch_keyboard()
-        elif name == "float":
-            self._toggle_float()
-        elif name == "hide":
-            if self.window_mode:
-                self.loop.stop()
-            else:
-                self._hide()
+            if self.view.page == SYMBOLS and not self.cfg.symbols_stay:
+                self._show_page(WRITE)
+        else:
+            self._commands[argument]()
         self.redraw()
+
+    @property
+    def _commands(self) -> dict:
+        return {"delete_word": self._delete_word, "language": self._language_key, "symbols": self._symbols_key,
+                "keyboard": self._switch_keyboard, "float": self._toggle_float, "settings": self._open_settings,
+                "hide": self._hide_key}
+
+    def _press_shortcut(self, name: str):
+        """Copy, cut, paste."""
+        if self.window_mode:
+            self.status = "only in the real panel"
+        elif not self.fake_keyboard.press(name):
+            self.status = f"{name} is not possible with this KWin"
+        elif name != "copy":
+            self.field.changed_behind_our_back()
+            self._forget_last()
+
+    def _hide_key(self):
+        if self.window_mode:
+            self.loop.stop()
+        else:
+            self._hide()
+
+    # -- pages: what the area below the suggestions shows ----------------
+
+    def _show_page(self, page: str):
+        tiles = []
+        if page == LANGUAGES:
+            lang = self.languages
+            tiles = [(LANGUAGE + (ALL_LANGUAGES if choice is ALL else choice), lang.title(choice),
+                      choice == lang.current or len(lang.codes) < 2) for choice in lang.choices()]
+            tiles.append((LANGUAGE + MORE_LANGUAGES, "More languages…", False))
+        self.view.show_page(page, tiles)
+        self._fit_linescale()
+
+    def _symbols_key(self):
+        """Swaps the writing area for the symbol keyboard and back."""
+        self._show_page(WRITE if self.view.page == SYMBOLS else SYMBOLS)
+
+    def _language_key(self):
+        if self.cfg.language_button == "next" and self.languages.can_switch():
+            self.languages.next()
+            self._language_changed()
+        else:
+            self._show_page(WRITE if self.view.page == LANGUAGES else LANGUAGES)
+
+    def _choose_language(self, choice: str):
+        """A tile of the language page was tapped."""
+        self._show_page(WRITE)
+        if choice == MORE_LANGUAGES:
+            self._open_settings("languages")
+            return
+        self.languages.select(ALL if choice == ALL_LANGUAGES else choice)
+        self._language_changed()
+
+    def _language_changed(self):
+        self.worker.configure(self.cfg, self.languages.active(), load_words())
+        self._forget_last()
 
     def _delete_word(self):
         """Ink that is not typed yet is thrown away; otherwise the text that
@@ -429,7 +618,7 @@ class Panel:
             self._clear_ink()
             return
         if self.last is not None:
-            count = len(self.last.text)
+            count = self.last.own_length
         else:
             count = last_word_length(self.field.before_cursor())
         self._forget_last()
@@ -451,6 +640,24 @@ class Panel:
         if not ok:
             self.status = "no other on-screen keyboard installed" if "installed" in msg else "switching failed"
 
+    def _open_settings(self, page: str = ""):
+        """The settings window is a program of its own (`kritzel settings`)."""
+        if self.settings_window is not None and self.settings_window.poll() is None:
+            return                              # still open (or a second tap on the button)
+        safe_path = ["-P"] if getattr(sys.flags, "safe_path", False) else []
+        command = [sys.executable, *safe_path, "-m", "kritzel", "settings", *([page] if page else [])]
+        try:
+            self.settings_window = subprocess.Popen(
+                command, env=control.window_environment(), start_new_session=True,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as e:
+            log.warning("could not open the settings: %s", e)
+            self.status = "could not open the settings"
+
+    @property
+    def language_label(self) -> str:
+        return self.languages.label
+
     # ------------------------------------------------------------------
     # Ink -> text
     # ------------------------------------------------------------------
@@ -464,8 +671,8 @@ class Panel:
         self.status = ""
         self.redraw()
 
-    def _on_model_error(self, _message: str):
-        self.status = "model failed to load – see `kritzel status`"
+    def _on_model_error(self, _message: str, fatal: bool):
+        self.status = ("recognition failed to start" if fatal else "settings not applied") + " – see `kritzel status`"
         self.redraw()
 
     def _schedule_recognition(self):
@@ -555,11 +762,33 @@ class Panel:
     # Suggestions
     # ------------------------------------------------------------------
 
+    def _context(self) -> Context:
+        """The text field as the next insertion finds it."""
+        before = self.field.before_cursor()
+        pending = self.last is not None and self.last.trailing_space and before.endswith(" ")
+        return Context(before, self.field.reported_before_cursor() is not None, pending)
+
+    def _auto_space(self) -> str:
+        # no automatic spaces in addresses, numbers and passwords
+        return "off" if self.field.plain else self.cfg.auto_space
+
+    def _compose(self, reading: str, context: Context):
+        return compose(reading, context, self._auto_space(), self.cfg.capitalize and not self.field.plain)
+
+    def _type(self, typed, context: Context) -> str:
+        """Puts composed text into the field.  Returns the span that a later
+        swap has to replace."""
+        if typed.eats_space:
+            self.field.replace(" ", typed.text)
+            return typed.text
+        self.field.commit(typed.text)
+        return (" " if context.space_pending else "") + typed.text
+
     def _insert(self, index: int):
-        text = self.candidates[index]
-        prefix = " " if self.cfg.auto_space and needs_space(self.field.before_cursor(), text) else ""
-        self.field.commit(prefix + text)
-        self.last = Insertion(prefix + text, prefix)
+        context = self._context()
+        typed = self._compose(self.candidates[index], context)
+        span = self._type(typed, context)
+        self.last = Insertion(span, len(typed.text), context, typed.trailing_space)
         self.selected = index
 
     def _choose(self, index: int):
@@ -570,9 +799,13 @@ class Panel:
             self._insert(index)             # manual mode
             self._ink_done()
         elif index != self.selected:
-            text = self.last.prefix + self.candidates[index]
-            if self.field.replace(self.last.text, text):
-                self.last = Insertion(text, self.last.prefix)
+            # the other reading, composed for the situation the first one met
+            context = self.last.context
+            typed = self._compose(self.candidates[index], context)
+            keeps_space = context.space_pending and not typed.eats_space
+            span = (" " if keeps_space else "") + typed.text
+            if self.field.replace(self.last.span, span):
+                self.last = Insertion(span, len(typed.text), context, typed.trailing_space)
                 self.selected = index
         self.redraw()
 
@@ -583,7 +816,7 @@ class Panel:
         reported = self.field.reported_before_cursor()
         if self.last is None or reported is None:
             return
-        if reported.endswith(self.last.text):
+        if reported.endswith(self.last.span):
             self.last.seen_in_field = True
         elif self.last.seen_in_field:
             self._forget_last()

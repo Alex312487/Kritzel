@@ -78,13 +78,15 @@ class LineScale:
     vertical position meaningful.
     """
 
-    def __init__(self, canvas_height: float):
-        self.top = canvas_height * 0.22
-        self.bottom = canvas_height * 0.78
-        self.samples = 0
+    def __init__(self, canvas_top: float, canvas_height: float):
+        self.reset(canvas_top, canvas_height)
 
-    def reset(self, canvas_height: float):
-        self.__init__(canvas_height)
+    def reset(self, canvas_top: float, canvas_height: float):
+        """Starts again with the band a writer typically uses in a writing
+        area at canvas_top, canvas_height (panel coordinates)."""
+        self.top = canvas_top + canvas_height * 0.22
+        self.bottom = canvas_top + canvas_height * 0.78
+        self.samples = 0
 
     @property
     def height(self) -> float:

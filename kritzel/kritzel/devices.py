@@ -46,11 +46,12 @@ class _PenTool:
 
 
 class InputDevices:
-    def __init__(self, session, sink, palm_zone):
-        """palm_zone(x, y) -> True where a resting hand must not draw."""
+    def __init__(self, session, sink, writing_area, cfg):
+        """writing_area(x, y) -> True where a touch would draw."""
         self.session = session
         self.sink = sink
-        self.palm_zone = palm_zone
+        self.writing_area = writing_area
+        self.configure(cfg)
         self.pointer = None
         self.pointer_shape = None
         self.pointer_pos = (0.0, 0.0)
@@ -68,6 +69,10 @@ class InputDevices:
             if session.has("zwp_tablet_manager_v2"):
                 self.tablet_seat = session.g["zwp_tablet_manager_v2"].get_tablet_seat(session.g["wl_seat"])
                 self.tablet_seat.dispatcher["tool_added"] = self._on_tool_added
+
+    def configure(self, cfg):
+        self.finger_writes = cfg.finger_writes      # False: fingers only press buttons
+        self.palm_rejection = cfg.palm_rejection    # fingers cannot write while the pen is near
 
     def position_of(self, source) -> tuple[float, float]:
         if source == "pointer":
@@ -123,10 +128,13 @@ class InputDevices:
     def _touch_down(self, _t, _serial, _time, _surface, tid, x, y):
         x, y = float(x), float(y)
         self.touch_pos[tid] = (x, y)
-        # palm rejection: while the pen hovers, fingers may press buttons but not draw
-        pen_around = self.pen_near or time.monotonic() - self.pen_left_at < PALM_GRACE
-        if pen_around and self.palm_zone(x, y):
-            return
+        if self.writing_area(x, y):
+            if not self.finger_writes:
+                return
+            # palm rejection: while the pen hovers, fingers may press buttons but not draw
+            pen_around = self.pen_near or time.monotonic() - self.pen_left_at < PALM_GRACE
+            if self.palm_rejection and pen_around:
+                return
         self.sink.press(("touch", tid), x, y)
 
     def _touch_motion(self, _t, _time, tid, x, y):

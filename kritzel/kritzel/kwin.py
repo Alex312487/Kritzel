@@ -37,20 +37,43 @@ def force_activate() -> tuple[int, str]:
     return r.returncode, r.stderr.strip()
 
 
-def ask_will_show(loop, callback, *args):
-    """Asks KWin whether it would show a docked keyboard right now (the text
-    field was tapped with pen or finger, not typed into) and calls
-    callback(answer, *args) on the loop thread.  Without an answer: True."""
+def force_activate_soon():
+    """force_activate() without waiting for the result."""
     busctl = _busctl()
     if busctl is None:
-        loop.call_soon_threadsafe(callback, True, *args)
+        return
+    try:
+        subprocess.Popen([busctl, "--user", "call", *_TARGET, "forceActivate"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+def ask_will_show(loop, callback, *args):
+    """Asks KWin whether it would show a keyboard right now, that is whether
+    the last thing the user did was done with a finger or the pen rather
+    than mouse, touchpad or keyboard.  Calls callback(answer, *args) on the
+    loop thread.  Without an answer: True."""
+    _ask(loop, callback, args, ["call", *_TARGET, "willShowOnActive"], default=True)
+
+
+def ask_visible(loop, callback, *args):
+    """Asks KWin whether the docked panel is on screen at this moment and
+    calls callback(answer, *args) on the loop thread.  Without an answer:
+    True."""
+    _ask(loop, callback, args, ["get-property", *_TARGET, "visible"], default=True)
+
+
+def _ask(loop, callback, args, command, default: bool):
+    busctl = _busctl()
+    if busctl is None:
+        loop.call_soon_threadsafe(callback, default, *args)
         return
 
     def run():
-        answer = True
+        answer = default
         try:
-            r = subprocess.run([busctl, "--user", "call", *_TARGET, "willShowOnActive"],
-                               capture_output=True, text=True, timeout=3)
+            r = subprocess.run([busctl, "--user", *command], capture_output=True, text=True, timeout=3)
             if r.returncode == 0:
                 answer = "true" in r.stdout
         except (OSError, subprocess.SubprocessError):

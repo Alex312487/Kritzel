@@ -6,7 +6,9 @@
     kritzel keyboard   switch to the normal on-screen keyboard
     kritzel switch     toggle between the two
     kritzel disable    restore exactly the setting from before Kritzel
-    kritzel restart    restart the panel (after changing settings)
+    kritzel settings   open the settings window
+    kritzel reload     make the running panel read its settings again
+    kritzel restart    restart the panel (after an update)
     kritzel status     show configuration and run a recognition self-test
     kritzel show       ask KWin to show the panel now (bind it to a shortcut)
 """
@@ -22,7 +24,7 @@ import sys
 
 from .config import APP_DIR, CONFIG_FILE, STATE_DIR, Config
 
-from . import kwin, switch
+from . import control, kwin, switch
 from .switch import PREVIOUS_FILE, is_ours as _is_ours, kread as _kread, kwrite as _kwrite
 
 LOG_FILE = os.path.join(STATE_DIR, "kritzel.log")
@@ -89,24 +91,30 @@ def cmd_disable(_args):
     return 0
 
 
-def pid_file() -> str:
-    return os.path.join(os.environ.get("XDG_RUNTIME_DIR") or STATE_DIR, "kritzel.pid")
-
-
 def cmd_show(_args):
     rc, error = kwin.force_activate()
     if rc != 0:
         print(error, file=sys.stderr)
     # KWin only knows about the docked panel; tell a floating one directly
-    try:
-        with open(pid_file(), encoding="ascii") as f:
-            pid = int(f.read().strip())
-        with open(f"/proc/{pid}/cmdline", "rb") as f:
-            if b"kritzel" in f.read():
-                os.kill(pid, signal.SIGUSR1)
-    except (OSError, ValueError):
-        pass
+    control.show_panel()
     return rc
+
+
+def cmd_reload(_args):
+    if control.reload_panel():
+        print("Settings reloaded.")
+        return 0
+    print("The panel is not running (it starts with the settings in effect).")
+    return 0
+
+
+def cmd_settings(args):
+    if control.running_pid("kritzel-settings") is not None:
+        print("The settings window is already open.")
+        return 0
+    from .settings import run
+
+    return run(args.page or "")
 
 
 def self_test(cfg: Config) -> tuple[bool, str]:
@@ -163,10 +171,12 @@ def cmd_status(args):
     if missing:
         return 1
     try:
-        from .recognizer import Lexicon
+        from .config import load_words
+        from .lexicon import Lexicon
 
-        lex = Lexicon(cfg.dictionary_languages(), cfg.dictionary_weight)
+        lex = Lexicon(cfg.dictionary_languages(), cfg.dictionary_weight, load_words())
         print(f"dictionaries     : {', '.join(os.path.basename(p) for p in lex.loaded) or 'none found (optional)'}")
+        print(f"personal words   : {len(lex.personal)}")
         ok, msg = self_test(cfg)
     except Exception as e:  # noqa: BLE001
         ok, msg = False, f"{type(e).__name__}: {e}"
@@ -179,6 +189,7 @@ def cmd_run(args, window_mode: bool):
     log = logging.getLogger("kritzel")
     # Qt is only used to paint into images; it must not open its own Wayland
     # connection (and must not swallow KWin's WAYLAND_SOCKET).
+    control.original_qt_platform = os.environ.get("QT_QPA_PLATFORM")
     os.environ["QT_QPA_PLATFORM"] = "offscreen"
     from PyQt6.QtGui import QGuiApplication
 
@@ -201,11 +212,7 @@ def cmd_run(args, window_mode: bool):
         return 1
     log.info("kritzel started (%s)", "try-out window" if window_mode else "input method")
     if not window_mode:
-        try:
-            with open(pid_file(), "w", encoding="ascii") as f:
-                f.write(str(os.getpid()))
-        except OSError:
-            pass
+        control.write_pid()
     try:
         panel.run()
     except KeyboardInterrupt:
@@ -225,14 +232,16 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="kritzel", description="Handwriting input panel for KDE Plasma (Wayland).")
     ap.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     ap.add_argument("command", nargs="?", default="run",
-                    choices=["run", "try", "enable", "disable", "keyboard", "switch", "restart", "status", "show"])
+                    choices=["run", "try", "enable", "disable", "keyboard", "switch", "settings", "reload", "restart",
+                             "status", "show"])
+    ap.add_argument("page", nargs="?", help="for `settings`: the page to open, e.g. languages")
     args = ap.parse_args(argv)
     if args.command == "run":
         return cmd_run(args, window_mode=False)
     if args.command == "try":
         return cmd_run(args, window_mode=True)
     return {"enable": cmd_enable, "disable": cmd_disable, "keyboard": cmd_keyboard, "switch": cmd_switch, "restart": cmd_restart,
-            "status": cmd_status, "show": cmd_show}[args.command](args)
+            "status": cmd_status, "show": cmd_show, "settings": cmd_settings, "reload": cmd_reload}[args.command](args)
 
 
 if __name__ == "__main__":
