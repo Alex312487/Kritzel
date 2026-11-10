@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Handwriting / Keyboard
+Name[de]=Handschrift / Tastatur
+GenericName=Switch on-screen input
+GenericName[de]=Bildschirmeingabe umschalten
+Comment=Switch between the Kritzel handwriting panel and the normal on-screen keyboard
+Comment[de]=Zwischen Kritzel-Handschrifteingabe und der normalen Bildschirmtastatur umschalten
+Exec=@EXEC@ switch
+Icon=draw-freehand
+Categories=Utility;
