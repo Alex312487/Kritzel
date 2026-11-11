@@ -52,6 +52,22 @@ def starts_sentence(context: Context) -> bool:
     return before[-1] in SENTENCE_END or before[-1] == "\n"
 
 
+def mid_sentence(context: Context) -> bool:
+    """The next word follows a word or a comma: a capital letter would be
+    unusual there.  (After a quotation mark or a bracket nobody can tell.)"""
+    before = context.before.rstrip(" ")
+    return bool(before) and (before[-1].isalnum() or before[-1] in ",;")
+
+
+def unfinished_word(before: str, longest: int = 40) -> str:
+    """The letters right before the cursor: the word that writing would
+    continue.  Empty after a space, a digit or a punctuation mark."""
+    start = len(before)
+    while start and len(before) - start < longest and before[start - 1].isalpha():
+        start -= 1
+    return before[start:]
+
+
 def compose(reading: str, context: Context, auto_space: str = "after", capitalize: bool = False) -> Typed:
     """auto_space is "after", "before" or "off"."""
     if not reading:

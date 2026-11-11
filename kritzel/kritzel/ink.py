@@ -23,6 +23,10 @@ class Stroke:
         self.points.append((x, y))
         return True
 
+    def shift(self, dx: float):
+        """Moves the stroke sideways."""
+        self.points = [(x + dx, y) for x, y in self.points]
+
     def bounds(self):
         xs = [p[0] for p in self.points]
         ys = [p[1] for p in self.points]

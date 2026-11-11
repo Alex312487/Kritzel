@@ -23,9 +23,13 @@ KEYSYMS = {BACKSPACE: 0xFF08, ENTER: 0xFF0D,         # XKB_KEY_BackSpace, XKB_KE
            "left": 0xFF51, "up": 0xFF52, "right": 0xFF53, "down": 0xFF54,
            "tab": 0xFF09, "delete": 0xFFFF, "home": 0xFF50, "end": 0xFF57}
 
-# content purposes (text-input protocol) of fields that hold no prose:
-# digits, number, phone, url, email, password
-PLAIN_PURPOSES = {2, 3, 4, 5, 6, 8}
+# content purposes (text-input protocol)
+DIGITS, NUMBER, PHONE, URL, EMAIL, PASSWORD, DATE, TIME, DATETIME, TERMINAL = 2, 3, 4, 5, 6, 8, 9, 10, 11, 12
+# fields that hold no prose: no automatic spaces, no capitals
+PLAIN_PURPOSES = {DIGITS, NUMBER, PHONE, URL, EMAIL, PASSWORD, DATE, TIME, DATETIME}
+# fields for numbers, and what may be written there besides the digits
+NUMERIC_PURPOSES = {DIGITS: "", NUMBER: "+-.,", PHONE: "+-()/#* ", DATE: "./- ", TIME: ":. ", DATETIME: "./-: "}
+DIGIT_CHARACTERS = "0123456789"
 HINT_HIDDEN_TEXT = 0x40
 
 # Applications handle key presses later than input-method text (Qt queues
@@ -58,7 +62,17 @@ class TextField:
         self._reported = None           # text before the cursor as reported by the app
         self._reports_text = False      # the app has reported real text at least once
         self._held_back = None          # text waiting for Backspace keys to be handled
-        self.plain = False              # the field holds no prose (address, number, password)
+        self._describe(0, 0)
+
+    def _describe(self, hint: int, purpose: int):
+        """What kind of field it is, from the application's description."""
+        self.secret = purpose == PASSWORD or bool(hint & HINT_HIDDEN_TEXT)  # what is written must not be shown
+        self.plain = purpose in PLAIN_PURPOSES or self.secret       # the field holds no prose
+        # ordinary text, from which words may be learnt (a terminal sees passwords, too)
+        self.prose = not self.plain and purpose != TERMINAL
+        marks = NUMERIC_PURPOSES.get(purpose)
+        # the only characters that make sense in the field; None: any
+        self.numeric = None if marks is None or self.secret else DIGIT_CHARACTERS + marks
 
     # -- focus -------------------------------------------------------------
 
@@ -74,7 +88,7 @@ class TextField:
         self._tail = ""
         self._reported = None
         self._reports_text = False
-        self.plain = False
+        self._describe(0, 0)
         ctx.dispatcher["content_type"] = self._on_content_type
         ctx.dispatcher["surrounding_text"] = self._on_surrounding_text
         ctx.dispatcher["commit_state"] = self._on_commit_state
@@ -108,7 +122,8 @@ class TextField:
         self.on_state()
 
     def _on_content_type(self, _ctx, hint, purpose):
-        self.plain = purpose in PLAIN_PURPOSES or bool(hint & HINT_HIDDEN_TEXT)
+        self._describe(hint, purpose)
+        self.on_state()
 
     def _on_commit_state(self, _ctx, serial):
         self.serial = serial
@@ -219,6 +234,9 @@ class PreviewField:
 
     replace_with_keys = False
     plain = False
+    prose = True
+    secret = False
+    numeric = None
     active = True
 
     def __init__(self):

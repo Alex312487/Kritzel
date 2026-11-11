@@ -404,6 +404,97 @@ def test_nearest_personal_word_is_chosen_as_before():
                 assert lex._nearest_personal(w) == reference(lex, w), (w, list(lex.personal))
 
 
+# -- learnt words, imported settings, password fields (version 1.5) -----------
+
+def test_learnt_words_file_is_private_and_may_hold_anything():
+    from kritzel.learning import MAX_COUNT, MAX_WORDS, LearnedWords
+    d = tempfile.mkdtemp(); path = os.path.join(d, "state", "learned.json")
+    words = LearnedWords(path); words.note("Kritzel", ""); words.note("Kritzel", "")
+    assert mode(path) == 0o600 and mode(os.path.dirname(path)) == 0o700 and os.listdir(os.path.dirname(path)) == ["learned.json"]
+    for junk in ("", "[]", "null", '{"words": 5}', '{"words": [1, 2]}', "[" * 100000, "\xff\xfe", '{"words": {"a": NaN}}'):
+        with open(path, "w", encoding="latin-1") as f: f.write(junk)
+        assert LearnedWords(path).counts == {}, junk[:20]
+    entries = {"good": 2, "many": 10 ** 9, "x": 3, "two words": 3, "pass_word": 3, "abc1": 3, "line\nbreak": 3,
+               "w" * 41: 3, "zero": 0, "minus": -1, "text": "3", "real": 2.5, "yes": True, "nested": {"a": 1}}
+    with open(path, "w") as f: f.write(__import__("json").dumps({"words": entries}))
+    assert LearnedWords(path).counts == {"good": 2, "many": MAX_COUNT}, "only words made of letters, with a sane count"
+    with open(path, "w") as f:
+        f.write(__import__("json").dumps({"words": {"w" + "".join(chr(97 + int(c)) for c in str(i)): 2 for i in range(MAX_WORDS * 3)}}))
+    assert len(LearnedWords(path).counts) == MAX_WORDS
+    with open(path, "w") as f: f.write('{"words": {"good": 2}, "padding": "' + "x" * 300000 + '"}')
+    assert LearnedWords(path).counts == {}, "a file far too large is not ours"
+    target = os.path.join(d, "elsewhere"); os.remove(path); os.symlink(target, path + ".tmp")
+    LearnedWords(path).note("word", ""); assert not os.path.exists(target), "no predictable temporary name to plant a link at"
+
+
+def test_imported_settings_are_checked_value_by_value():
+    from kritzel import transfer
+    def parse(settings, words=()): return transfer.parse(__import__("json").dumps(
+        {"format": transfer.FORMAT, "version": transfer.VERSION, "settings": settings, "words": list(words)}))
+    values, words = parse({"height": "99999", "show": "sometimes", "delay_ms": "abc", "pen_width": "nan", "ink_color": "red",
+                           "model": "/tmp/evil.onnx", "threads": "64", "no_such_setting": "1", "keys": 5,
+                           "symbols": "a b\n[recognition]\nmodel = /tmp/evil.onnx", "languages": "de_DE, ../../etc/passwd, en_US",
+                           "symbol_keys": "x" * 5000},
+                          ["Kritzel", "two\nlines", 7, None, "#comment", "w" * 65, "Kritzel", ["nested"]])
+    assert "model" not in values and "threads" not in values and "no_such_setting" not in values and "keys" not in values
+    assert values["height"] == "900" and values["show"] == "touch" and values["delay_ms"] == "800"
+    assert values["pen_width"] == "2.6" and values["ink_color"] == "", "limits and known choices as in the settings file"
+    assert "\n" not in values["symbols"] and values["languages"] == "de_DE, en_US" and len(values["symbol_keys"]) == transfer.MAX_VALUE_LENGTH
+    assert words == ["Kritzel", "two lines"], "single lines, strings only, no duplicates"
+    # what was imported can be saved without a value adding settings of its own
+    d = tempfile.mkdtemp(); path = os.path.join(d, "config.ini"); save_config(values, path)
+    assert Config(path).model == "small" and Config(path).symbols.startswith("a b [recognition]")
+    assert len(parse({}, ["w%d" % i for i in range(transfer.MAX_WORDS + 50)])[1]) == transfer.MAX_WORDS
+    for junk in ("", "{}", "[]", "null", '{"format": "other"}', "[" * 100000, '{"format": "kritzel-settings"}',
+                 '{"format": "kritzel-settings", "version": 2}', '{"format": "kritzel-settings", "version": "1"}',
+                 '{"format": "kritzel-settings", "version": 1, "settings": [], "words": []}',
+                 '{"format": "kritzel-settings", "version": 1, "settings": {}, "words": "abc"}'):
+        try: transfer.parse(junk); raise AssertionError(junk[:40])
+        except transfer.NotASettingsFile: pass
+
+
+def test_settings_file_for_another_computer():
+    from kritzel import transfer
+    d = tempfile.mkdtemp(); path = os.path.join(d, "mine.kritzel.json")
+    transfer.save(path, {"height": "300", "model": "/home/me/private/model.onnx"}, ["Kritzel"])
+    assert mode(path) == 0o600, "it holds the user's words"
+    assert "private" not in open(path).read(), "paths of this computer do not travel"
+    big = os.path.join(d, "big.json")
+    with open(big, "w") as f: f.write(" " * (transfer.MAX_FILE_BYTES + 1) + open(path).read())
+    for bad in (big, os.path.join(d, "missing"), d):
+        try: transfer.load(bad); raise AssertionError(bad)
+        except transfer.NotASettingsFile: pass
+    with open(big, "wb") as f: f.write(b"\xff\xfe\x00")
+    try: transfer.load(big); raise AssertionError("not text")
+    except transfer.NotASettingsFile: pass
+
+
+def test_password_fields_show_dots():
+    from PyQt6.QtGui import QGuiApplication, QImage, QPainter
+    from kritzel import ui
+    from kritzel.config import Theme
+    app = QGuiApplication.instance() or QGuiApplication(sys.argv[:1])
+    cfg = Config(os.devnull); view = ui.View(Theme(), cfg)
+    assert view.shown("hunter2", secret=True) == ui.HIDDEN * 7 and view.shown("hunter2", secret=False) == "hunter2"
+
+    class State:
+        strokes, candidates, selected, status, pending, pressed = [], ["hunter2", "hunterz"], 0, "", "secret", None
+        hint, preview, language_label, secret = "", None, "EN", True
+
+    drawn = []
+    class Spy(QPainter):
+        def drawText(self, *args): drawn.append(args[-1]); super().drawText(*args)
+    def paint():
+        drawn.clear(); image = QImage(800, 280, QImage.Format.Format_RGB32); p = Spy(image); view.paint(p, State); p.end()
+        return " ".join(drawn)
+    text = paint()
+    assert "hunter" not in text and "secret" not in text and ui.HIDDEN * 7 in text, "neither the suggestions nor the preview"
+    assert [chip.text for chip in view.chips] == State.candidates, "the chips still stand for the readings"
+    State.secret = False; assert "hunter2" in paint() and "secret" in paint()
+    State.secret = True; cfg.hide_passwords = False; view.configure(cfg); assert "hunter2" in paint(), "the user's choice"
+    del app
+
+
 def test_labels_show_text_as_it_is():
     from PyQt6.QtCore import Qt
     from PyQt6.QtWidgets import QApplication

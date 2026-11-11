@@ -24,9 +24,10 @@ from PyQt6.QtWidgets import (
     QListWidgetItem, QPushButton, QScrollArea, QSlider, QSpinBox, QStackedWidget, QVBoxLayout, QWidget,
 )
 
-from . import control, keys, languages, switch
+from . import control, keys, languages, switch, transfer
 from .config import (APP_DIR, CONFIG_FILE, DEFAULT_SYMBOL_KEYS, DEFAULT_SYMBOLS, OPTION, STATE_DIR, WORDS_FILE,
                      Config, Theme, load_words, save_config, save_words)
+from .learning import LEARNED_AFTER, LEARNED_FILE, LearnedWords
 from .lexicon import find_dictionary
 from .ui import View
 
@@ -164,6 +165,8 @@ class PanelPage(Page):
 
         form = self.group("Suggestions")
         form.addRow("Readings offered:", self.number("suggestions"))
+        form.addRow(self.check("hide_passwords", "In password fields, show dots instead of what was read"))
+        form.addRow(note("Keeps a password from being read off the panel by somebody next to you."))
         self.column.addStretch(1)
 
 
@@ -186,9 +189,7 @@ class PanelPreview(QWidget):
 
     def paintEvent(self, _event):
         self.shown = self.current_values()
-        cfg = Config(os.devnull)
-        for key, text in self.shown.items():
-            setattr(cfg, key, OPTION[key].parse(text))
+        cfg = Config.from_values(self.shown)
         view = View(self.theme, cfg)
         # the panel as on a screen 1100 wide, scaled to fit
         width, height = 1100.0, float(cfg.height)
@@ -202,7 +203,7 @@ class PanelPreview(QWidget):
 
     # what ui.View.paint wants to know about the panel's state
     strokes, candidates, selected, status, pressed = [], ["Hello", "Hallo"], 0, "", None
-    hint, preview, language_label = "Write here", None, "EN"
+    hint, preview, language_label, pending, secret = "Write here", None, "EN", "", False
 
 
 class KeysPage(Page):
@@ -288,6 +289,18 @@ class WritingPage(Page):
                          "pick suggestions and move the floating panel."))
         form.addRow(self.check("palm_rejection", "Ignore fingers in the writing area while the pen is near"))
         form.addRow(note("Keeps the hand that rests on the screen from drawing."))
+
+        form = self.group("Gestures")
+        form.addRow(self.check("gestures", "Some strokes are commands"))
+        form.addRow(note(
+            "Over writing that is not typed yet:\n"
+            "    •  a zigzag across it rubs it out\n"
+            "    •  a line from the top of the writing area to its bottom opens a gap between two words "
+            "that ran together\n"
+            "In the empty writing area:\n"
+            "    •  a long line to the left deletes the last word (like the word key)\n"
+            "    •  a long line to the right types a space\n"
+            "    •  down, then a long line to the left, is Enter"))
         self.column.addStretch(1)
 
     def _show_color(self, value: str):
@@ -314,12 +327,24 @@ class RecognitionPage(Page):
         form.addRow("Pause before recognising:", self.number("delay_ms", " ms", 50))
         form.addRow(note("How long the panel waits after your last stroke. Raise it if words get split "
                          "because you write slowly; lower it if the text takes too long to appear."))
+        form.addRow(self.check("delay_auto", "Fit the pause to my writing"))
+        form.addRow(note("The panel measures the breaks you make while writing and waits longer if you write "
+                         "slowly, shorter if you write fast. The pause above is where it starts from."))
+        form.addRow(self.check("preview", "Show what was read while the pause still runs"))
+        form.addRow(note("The reading appears in grey at the right of the suggestions as soon as you lift the "
+                         "pen, and is typed when the pause is over."))
         form.addRow("Characters:", self.choice("scripts", {
             "western": "Western European (English, German, French, Spanish, Nordic …)",
             "latin": "All Latin alphabets (adds Polish, Czech, Turkish, Hungarian …)",
             "all": "Everything the model knows (adds Chinese and Japanese)"}))
         form.addRow(note("Fewer possible characters mean fewer mix-ups. The letters of the language you "
                          "chose are always included."))
+        form.addRow(self.check("number_fields", "In number fields, recognise only digits"))
+        form.addRow(note("Fields for numbers, phone numbers, dates and times, where the application says so. "
+                         "An \"l\" or an \"O\" cannot be read there."))
+        form.addRow(self.check("context", "Let the text before the cursor help"))
+        form.addRow(note("Letters written right after a word are read as the rest of that word, and in the "
+                         "middle of a sentence \"some\" is preferred to \"Some\"."))
 
         form = self.group("Typing")
         form.addRow(self.check("auto_insert", "Type the recognised text right away"))
@@ -457,6 +482,77 @@ class PersonalWordsPage(Page):
         self.add_button.setEnabled(False)
         self.remove_button.clicked.connect(self.remove_selected)
         self.list.itemSelectionChanged.connect(self._update)
+        self._build_learned_words()
+
+    # -- words learnt from the user's picks (learning.py) -----------------------
+
+    def _build_learned_words(self):
+        box = QGroupBox("Learnt words")
+        v = QVBoxLayout(box)
+        v.addWidget(self.check("learn", "Learn the words I pick from the suggestions"))
+        v.addWidget(note(
+            f"A word you pick {LEARNED_AFTER} times in place of what Kritzel had typed is preferred from then on, "
+            "like a personal word. Nothing is learnt in password, address and number fields."))
+        self.learned_list = QListWidget()
+        self.learned_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.learned_list.setAlternatingRowColors(True)
+        self.learned_list.setSortingEnabled(True)
+        self.learned_list.setMaximumHeight(110)
+        v.addWidget(self.learned_list)
+        row = QHBoxLayout()
+        self.learned_count = note("")
+        self.keep_button = QPushButton(QIcon.fromTheme("list-add"), "Make personal words")
+        self.keep_button.setToolTip("Moves the selected words to your personal words above.")
+        self.forget_button = QPushButton(QIcon.fromTheme("list-remove"), "Forget selected")
+        self.forget_all_button = QPushButton("Forget all")
+        for widget, stretch in ((self.learned_count, 1), (self.keep_button, 0), (self.forget_button, 0),
+                                (self.forget_all_button, 0)):
+            row.addWidget(widget, stretch)
+        v.addLayout(row)
+        self.column.addWidget(box)
+        self.forgotten: set[str] = set()        # removed here; removed from the file by save_learned()
+        self.keep_button.clicked.connect(self._keep_learned)
+        self.forget_button.clicked.connect(lambda: self._forget_learned(self.learned_list.selectedItems()))
+        self.forget_all_button.clicked.connect(lambda: self._forget_learned(self._learned_items()))
+        self.learned_list.itemSelectionChanged.connect(self._update_learned)
+        self.load_learned()
+
+    def _learned_items(self):
+        return [self.learned_list.item(i) for i in range(self.learned_list.count())]
+
+    def load_learned(self):
+        self.forgotten.clear()
+        self.learned_list.clear()
+        self.learned_list.addItems(LearnedWords().words())
+        self._update_learned()
+
+    def _update_learned(self):
+        n = self.learned_list.count()
+        self.learned_count.setText("Nothing learnt yet" if n == 0 else f"{n} word{'s' if n != 1 else ''}")
+        selected = bool(self.learned_list.selectedItems())
+        self.keep_button.setEnabled(selected)
+        self.forget_button.setEnabled(selected)
+        self.forget_all_button.setEnabled(n > 0)
+
+    def _forget_learned(self, items):
+        for item in items:
+            self.forgotten.add(item.text())
+            self.learned_list.takeItem(self.learned_list.row(item))
+        self._update_learned()
+
+    def _keep_learned(self):
+        items = self.learned_list.selectedItems()
+        existing = set(self._listed())
+        self.list.addItems([item.text() for item in items if item.text() not in existing])
+        self._forget_learned(items)
+        self._update()
+
+    def save_learned(self):
+        """Takes the words removed in the window out of the file.  The file
+        is read afresh: the panel may have learnt more in the meantime."""
+        if self.forgotten:
+            LearnedWords().forget(self.forgotten)
+            self.forgotten.clear()
 
     def _update(self):
         n = self.list.count()
@@ -495,7 +591,9 @@ class AdvancedPage(Page):
     title = "Advanced"
     icon = "preferences-other"
 
-    def __init__(self):
+    def __init__(self, export_settings, import_settings):
+        """export_settings, import_settings: what the two buttons do (the
+        window knows all pages)."""
         super().__init__()
         form = self.group("On-screen keyboard")
         self.keyboard_state = plain_label()
@@ -535,9 +633,24 @@ class AdvancedPage(Page):
         self.bind("model", self._read_model, self._show_model)
         form.addRow("Processor threads:", self.number("threads"))
 
+        form = self.group("Another computer")
+        export_button = QPushButton(QIcon.fromTheme("document-export"), "Export…")
+        import_button = QPushButton(QIcon.fromTheme("document-import"), "Import…")
+        export_button.clicked.connect(export_settings)
+        import_button.clicked.connect(import_settings)
+        row = QHBoxLayout()
+        row.addWidget(export_button)
+        row.addWidget(import_button)
+        row.addStretch(1)
+        form.addRow(row)
+        form.addRow(note("Export writes the settings as they are shown in this window, and your personal words, "
+                         "into one file. Import shows the settings of such a file here; they are used once you "
+                         "press Apply or OK. The recognition model and the processor threads belong to a "
+                         "computer and are not carried over."))
+
         form = self.group("Files")
         for label, path in (("Settings:", CONFIG_FILE), ("Personal words:", WORDS_FILE),
-                            ("Log:", os.path.join(STATE_DIR, "kritzel.log"))):
+                            ("Learnt words:", LEARNED_FILE), ("Log:", os.path.join(STATE_DIR, "kritzel.log"))):
             value = plain_label(path)
             value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             form.addRow(label, value)
@@ -604,7 +717,7 @@ class SettingsWindow(QDialog):
 
         self.words_page = PersonalWordsPage()
         self.pages = [PanelPage(), KeysPage(self.values), WritingPage(), RecognitionPage(), LanguagesPage(),
-                      self.words_page, AdvancedPage()]
+                      self.words_page, AdvancedPage(self.export_settings, self.import_settings)]
         self.sidebar = QListWidget()
         self.sidebar.setFixedWidth(190)
         self.sidebar.setIconSize(self.sidebar.iconSize() * 1.5)
@@ -658,10 +771,40 @@ class SettingsWindow(QDialog):
         self.load(Config(os.devnull))
         self.message.setText("Standard settings shown – Apply or OK to use them.")
 
+    def export_settings(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export settings", os.path.expanduser("~/kritzel" + transfer.SUFFIX),
+                                              f"Kritzel settings (*{transfer.SUFFIX})")
+        if not path:
+            return
+        try:
+            transfer.save(path, self.values(), self.words_page.words())
+        except OSError as e:
+            self.message.setText(f"Could not export: {e}")
+        else:
+            self.message.setText("Settings and personal words exported.")
+
+    def import_settings(self):
+        """Shows the settings of a file in the window, like restore_defaults()
+        shows the standard ones.  transfer.load() has checked every value."""
+        path, _ = QFileDialog.getOpenFileName(self, "Import settings", os.path.expanduser("~"),
+                                              f"Kritzel settings (*{transfer.SUFFIX});;All files (*)")
+        if not path:
+            return
+        try:
+            values, words = transfer.load(path)
+        except transfer.NotASettingsFile as e:
+            self.message.setText(str(e))
+            return
+        # what the file does not say (always: the settings of this computer) stays as it is
+        self.load(Config.from_values({**self.values(), **values}))
+        self.words_page.load_words(words)
+        self.message.setText("Imported settings shown – Apply or OK to use them.")
+
     def apply(self) -> bool:
         try:
             save_config(self.values())
             save_words(self.words_page.words())
+            self.words_page.save_learned()
         except OSError as e:
             self.message.setText(f"Could not save: {e}")
             return False

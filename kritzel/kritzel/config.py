@@ -102,11 +102,15 @@ OPTIONS = [
     Option("look", "pen_width", "float", 2.6, 1.0, 8.0),
     Option("look", "ink_color", "text", ""),                        # "" = the theme's text colour, or #rrggbb
     Option("look", "guide_line", "bool", True),
+    Option("look", "hide_passwords", "bool", True),                 # dots instead of readings in password fields
     # -- [input]: pen and fingers
     Option("input", "finger_writes", "bool", True),                 # false: fingers only press buttons
     Option("input", "palm_rejection", "bool", True),                # fingers cannot write while the pen is near
+    Option("input", "gestures", "bool", True),                      # scratch out, split, delete word, space, enter
     # -- [recognition]: from ink to text
     Option("recognition", "delay_ms", "int", 800, 150, 5000),       # pause after the last stroke
+    Option("recognition", "delay_auto", "bool", False),             # fit that pause to the writer (pace.py)
+    Option("recognition", "preview", "bool", True),                 # show the reading while the pause runs
     Option("recognition", "scripts", "choice", "western", choices=("western", "latin", "all")),
     Option("recognition", "languages", "text", "auto"),             # hunspell dictionaries, e.g. "en_US, de_DE"
     Option("recognition", "language_button", "choice", "list", choices=("list", "next")),
@@ -114,6 +118,9 @@ OPTIONS = [
     Option("recognition", "language_letters", "bool", True),        # only the letters of the language in use
     Option("recognition", "dictionary_weight", "float", 1.5, 0.0, 10.0),
     Option("recognition", "corrections", "choice", "suggest", choices=("off", "suggest", "auto")),
+    Option("recognition", "context", "bool", True),                 # the text before the cursor helps to read
+    Option("recognition", "number_fields", "bool", True),           # number fields: only digits are recognised
+    Option("recognition", "learn", "bool", True),                   # learn the words picked from the suggestions
     Option("recognition", "auto_insert", "bool", True),             # false: tap a suggestion to type it
     Option("recognition", "auto_space", "choice", "after", choices=("after", "before", "off"),
            legacy={"true": "after", "yes": "after", "on": "after", "1": "after",
@@ -124,6 +131,10 @@ OPTIONS = [
     Option("recognition", "threads", "int", 2, 1, 16),
 ]
 OPTION = {o.key: o for o in OPTIONS}
+# Settings that describe this computer rather than the user's taste; they stay
+# behind when settings are exported or imported (transfer.py).  `model` also
+# names a file the program loads, which no file from elsewhere should decide.
+MACHINE_SETTINGS = ("model", "threads")
 # settings that older versions kept in another section of the file.  (The
 # symbol row moved too but is deliberately not listed: version 1.3 wrote
 # "on" into every file, and since 1.4 it is off unless asked for.)
@@ -151,9 +162,22 @@ class Config:
             raw = cp.get(o.section, o.key, fallback=None)
             if raw is None and o.key in MOVED:
                 raw = cp.get(MOVED[o.key], o.key, fallback=None)
-            setattr(self, o.key, o.default if raw is None else o.parse(raw))
-        if not re.fullmatch(r"#[0-9a-fA-F]{6}", self.ink_color):
-            self.ink_color = ""
+            self._set(o, raw)
+
+    @classmethod
+    def from_values(cls, values: dict[str, str]) -> "Config":
+        """The settings for {key: text as in the file}; keys that are left
+        out have their defaults."""
+        cfg = cls(os.devnull)
+        for key, text in values.items():
+            cfg._set(OPTION[key], text)
+        return cfg
+
+    def _set(self, option: Option, raw):
+        value = option.default if raw is None else option.parse(raw)
+        if option.key == "ink_color" and not re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+            value = ""
+        setattr(self, option.key, value)
 
     def text(self, key: str) -> str:
         """The value of a setting as it is written in the file."""
@@ -209,7 +233,7 @@ def save_config(values: dict[str, str], path: str = CONFIG_FILE):
         if o.section != section:
             section = o.section
             lines += ["", f"[{section}]"]
-        lines.append(f"{o.key} = {_one_line(values[o.key])}")
+        lines.append(f"{o.key} = {one_line(values[o.key])}")
     write_atomically(path, "\n".join(lines) + "\n")
 
 
@@ -229,7 +253,7 @@ def load_words(path: str = WORDS_FILE) -> list[str]:
 
 
 def save_words(words, path: str = WORDS_FILE):
-    words = (_one_line(w) for w in words)
+    words = (one_line(w) for w in words)
     write_atomically(path, "".join(w + "\n" for w in words if w))
 
 
@@ -249,7 +273,7 @@ def save_state(state: dict):
         pass
 
 
-def _one_line(text: str) -> str:
+def one_line(text: str) -> str:
     """`text` with line breaks and other control characters turned into spaces.  A value
     with a line break in it would otherwise add lines of its own to the
     file, that is: other settings."""

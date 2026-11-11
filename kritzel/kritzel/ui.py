@@ -20,6 +20,8 @@ PAD = 6
 GRIP_W = 34
 KEY_WIDTHS = {"small": 50.0, "normal": 62.0, "large": 76.0}
 MAX_KEYS_SHARE = 0.5        # the keys take at most this share of the panel's width
+PENDING_SHARE = 0.45        # the reading that is not typed yet takes at most this share of the bar
+HIDDEN = "•"                # stands for a character in a password field
 
 # what the area below the suggestions shows
 WRITE, SYMBOLS, LANGUAGES = "write", "symbols", "languages"
@@ -199,6 +201,7 @@ class View:
         self.pen_width = cfg.pen_width
         self.ink_color = cfg.ink_color
         self.guide_line = cfg.guide_line
+        self.hide_passwords = cfg.hide_passwords
         self.layout(self.w, self.h)
 
     def has_key(self, name: str) -> bool:
@@ -289,8 +292,9 @@ class View:
         return pen
 
     def paint(self, p: QPainter, state):
-        """state: object with strokes, candidates, selected, status, pressed,
-        hint, preview and language_label attributes (see panel.Panel)."""
+        """state: object with strokes, candidates, selected, status, pending,
+        secret, pressed, hint, preview and language_label attributes (see
+        panel.Panel)."""
         c = self.theme.colors
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         p.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
@@ -338,6 +342,11 @@ class View:
             p.drawPath(st.path())
         p.restore()
 
+    def shown(self, text: str, secret: bool) -> str:
+        """`text` as the bar shows it: what is written into a password
+        field is not for the eyes of whoever stands behind the user."""
+        return HIDDEN * len(text) if secret and self.hide_passwords else text
+
     def _paint_bar(self, p, state):
         c = self.theme.colors
         self.chips = []
@@ -345,13 +354,15 @@ class View:
         y = 7
         h = BAR_H - 14
         right = self.bar.right() - 2
-        if state.status:
-            p.setFont(self.font(13))
+        # at the right: a message, or else the reading that is about to be typed
+        note, size = (state.status, 13) if state.status else (self.shown(state.pending, state.secret), 15)
+        if note:
+            p.setFont(self.font(size))
             fm = QFontMetricsF(p.font())
-            sw = fm.horizontalAdvance(state.status) + 8
+            note = fm.elidedText(note, Qt.TextElideMode.ElideLeft, max(40.0, (right - x) * PENDING_SHARE))
+            sw = fm.horizontalAdvance(note) + 8
             p.setPen(QColor(*c["inactive"]))
-            p.drawText(QRectF(right - sw, y, sw, h),
-                       Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, state.status)
+            p.drawText(QRectF(right - sw, y, sw, h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, note)
             right -= sw + PAD
         if state.preview is not None:
             # try-out window: show the text that would have been typed
@@ -368,7 +379,7 @@ class View:
             avail = right - x
             if avail < 48:
                 break
-            label = fm.elidedText(text, Qt.TextElideMode.ElideRight, min(avail - 20, 420.0))
+            label = fm.elidedText(self.shown(text, state.secret), Qt.TextElideMode.ElideRight, min(avail - 20, 420.0))
             w = fm.horizontalAdvance(label) + 20
             rect = QRectF(x, y, w, h)
             if primary:

@@ -41,8 +41,9 @@ class RecognitionWorker:
             self._thread = threading.Thread(target=self._run, args=(self._setup,), name="recognizer", daemon=True)
             self._thread.start()
 
-    def submit(self, generation: int, image):
-        self._jobs.put(("recognise", generation, image))
+    def submit(self, generation: int, image, hint=None):
+        """hint: a recognizer.Hint, what the text field tells about the writing."""
+        self._jobs.put(("recognise", generation, image, hint))
 
     def configure(self, cfg, languages=None, personal=()):
         """New settings, dictionary languages or personal words.  Takes
@@ -94,6 +95,8 @@ class RecognitionWorker:
         return lexicon
 
     def _run(self, setup):
+        from .recognizer import NO_HINT
+
         try:
             recognizer = self._load_model(setup[0], self._make_lexicon(setup))
             recognizer.set_letters(self._letters(setup))
@@ -112,10 +115,10 @@ class RecognitionWorker:
             newest = next((job for job in reversed(jobs) if job[0] == "recognise"), None)
             if newest is None:
                 continue                        # only the newest ink matters
-            _, generation, image = newest
+            _, generation, image, hint = newest
             try:
                 t0 = time.monotonic()
-                candidates = recognizer.recognize(image, setup[0].suggestions)
+                candidates = recognizer.recognize(image, setup[0].suggestions, hint or NO_HINT)
                 # what was written is nobody's business, not even the log's: it may be a password
                 log.debug("recognised %d readings (best: %d characters) in %.0f ms", len(candidates),
                           len(candidates[0][0]) if candidates else 0, (time.monotonic() - t0) * 1000)

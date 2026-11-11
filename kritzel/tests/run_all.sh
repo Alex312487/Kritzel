@@ -3,13 +3,18 @@
 # (plus pywayland >= 0.4.19 for the KWin test); KWIN = kwin_wayland binary.
 #
 #   test_units.py   pure logic, no compositor
+#   test_features.py   likewise: gestures, the ink reader (fake recogniser and
+#                   timers), fitted pause, history, learnt words, hints from
+#                   the text field, export and import
 #   test_hardening.py   files, signals, child processes and the wire protocol
 #                   keep to themselves: permissions, names that become paths,
-#                   stale pid files, malformed events
+#                   stale pid files, malformed events, imported settings,
+#                   learnt words, password fields
 #   it_pen.py       the real program against a scripted compositor (mockcomp.py):
 #                   pen, eraser, palm, scaling, floating, suggestions, spaces,
 #                   every kind of key, symbol keyboard, language list, applying
-#                   changed settings; IT_RESTORE: starting up floating
+#                   changed settings, gestures, walking back, number and
+#                   password fields, learning; IT_RESTORE: starting up floating
 #   run_it.sh       the real program inside a headless KWin, with a fake text
 #                   application (it_kwin.py) and injected touch / mouse input
 #
@@ -23,6 +28,7 @@ PY=${PY:-python3}; export PY
 fail=0
 run() { echo "=== $*"; out=$("$@" 2>&1); rc=$?; echo "$out" | grep -E "^(FAIL|SKIP)|Traceback"; echo "    $(echo "$out" | grep -c '^PASS') passed, exit $rc"; [ $rc -eq 0 ] || fail=1; }
 run "$PY" tests/test_units.py
+run "$PY" tests/test_features.py
 run "$PY" tests/test_hardening.py
 run "$PY" tests/it_pen.py
 IT_SCALE=2 run "$PY" tests/it_pen.py

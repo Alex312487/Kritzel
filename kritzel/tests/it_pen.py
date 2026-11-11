@@ -363,6 +363,87 @@ surf = dock_surface(); n_docks = docks(); pen_in(st["pen"]); pen_tap(*btn("hide"
 check("hide key removes the panel", surf not in m.objects and docks() == n_docks)
 proc.send_signal(signal.SIGUSR1); m.pump(0.6)
 check("`kritzel show` signal brings it back", docks() == n_docks + 1 and is_mapped(dock_surface()))
+
+# ---- version 1.5: gestures, walking back, number and password fields, learning ----
+def new_field(hint=0, purpose=0, serial_=20):
+    global ctx, surf
+    m.send(im, "deactivate", ctx); m.pump(0.4)
+    ctx = m.new_object("zwp_input_method_context_v1"); m.send(im, "activate", ctx)
+    m.send(ctx, "content_type", hint, purpose); m.send(ctx, "commit_state", serial_); m.pump(0.6)
+    surf = dock_surface(); pen_in(st["pen"])
+def sent(base_): return [(n, a_.get("text", a_.get("sym"))) for n, a_ in ctx_requests()[base_:] if n != "keysym" or a_["state"]]
+def straight(a_, b_, n=24): return [(a_[0] + (b_[0] - a_[0]) * i / n, a_[1] + (b_[1] - a_[1]) * i / n) for i in range(n + 1)]
+ctx = ctx3; new_field()
+CV = view().canvas; cy = CV.center().y()
+
+base = len(ctx_requests()); pen_write("hello", font="futural"); m.pump(0.45)
+check("the pause is still running: nothing typed yet", sent(base) == [], repr(sent(base)))
+m.pump(1.2); pen_write("again", font="futural"); m.pump(1.6)
+check("two words typed", sent(base) == [("commit_string", "hello "), ("commit_string", "again ")], repr(sent(base)))
+base = len(ctx_requests()); pen_stroke(st["pen"], straight((560.0, cy), (260.0, cy + 6))); m.pump(0.3)
+check("gesture: a long line to the left deletes the last word", sent(base) == [("keysym", 0xFF08)] * len("again "), repr(sent(base)))
+base = len(ctx_requests()); pen_tap(20, 22); m.pump(0.4)
+check("... and the suggestions of the word before it are back: tapping the chosen one changes nothing", sent(base) == [], repr(sent(base)))
+for x in range(80, 300, 12):                    # another reading of "hello"
+    pen_tap(x, 22)
+    if len(ctx_requests()) > base: break
+m.pump(0.5); swapped = sent(base)
+check("... and another one replaces that word", swapped[:-1] == [("keysym", 0xFF08)] * len("hello ") and swapped[-1][0] == "commit_string"
+      and swapped[-1][1] not in ("", "hello "), repr(swapped))
+base = len(ctx_requests()); pen_stroke(st["pen"], straight((560.0, cy), (260.0, cy - 5))); m.pump(0.3)
+check("walking back further deletes that word as it is now", sent(base) == [("keysym", 0xFF08)] * len(swapped[-1][1]), repr(sent(base)))
+base = len(ctx_requests()); pen_stroke(st["pen"], straight((260.0, cy), (560.0, cy + 4))); m.pump(0.3)
+check("gesture: a long line to the right is a space", sent(base) == [("commit_string", " ")], repr(sent(base)))
+base = len(ctx_requests()); pen_stroke(st["pen"], straight((600.0, cy - 40), (603.0, cy + 10)) + straight((603.0, cy + 10), (420.0, cy + 14))[1:]); m.pump(0.3)
+check("gesture: down and left is Enter", sent(base) == [("keysym", 0xFF0D)], repr(sent(base)))
+base = len(ctx_requests()); pen_stroke(st["pen"], straight((300.0, cy), (360.0, cy))); m.pump(1.6)
+check("a short line is writing, not a gesture", [n for n, _ in sent(base)] == ["commit_string"], repr(sent(base)))
+
+base = len(ctx_requests()); pen_write("oops", font="futural")
+zig = []
+for k in range(5): zig += straight((40.0, cy + 4 * k), (330.0, cy + 4 * k + 2), 12)[:: (1 if k % 2 == 0 else -1)]
+pen_stroke(st["pen"], zig); m.pump(1.6)
+check("gesture: a zigzag over the waiting ink rubs it out", sent(base) == [], repr(sent(base)))
+pen_write("ok", font="futural"); m.pump(1.6)
+check("... and writing goes on", sent(base) == [("commit_string", "ok ")], repr(sent(base)))
+
+# the same strokes with gestures switched off are ink
+write_conf(CONF + "[input]\ngestures=false\n"); proc.send_signal(signal.SIGHUP); m.pump(0.8)
+base = len(ctx_requests()); pen_stroke(st["pen"], straight((560.0, cy), (260.0, cy + 6))); m.pump(1.6)
+check("gestures switched off: the long line is read as writing", all(n == "commit_string" for n, _ in sent(base)), repr(sent(base)))
+write_conf(CONF); proc.send_signal(signal.SIGHUP); m.pump(0.8)
+
+# a field for digits
+new_field(purpose=2, serial_=21)
+base = len(ctx_requests()); pen_write("hello", font="futural"); m.pump(1.6)
+got = sent(base)
+check("number field: whatever is written, nothing but digits is typed",
+      all(n == "commit_string" and text.isdigit() for n, text in got), repr(got))
+base = len(ctx_requests()); pen_write("2017", font="futural"); m.pump(1.6)
+check("number field: digits are read as digits", sent(base) == [("commit_string", "2017")], repr(sent(base)))
+
+# learning: a reading picked twice in place of what was typed is kept - but not from a password field
+learned_file = tmp + "/s/kritzel/learned.json"
+def learned_counts(): return json.load(open(learned_file))["words"] if os.path.isfile(learned_file) else {}
+def write_and_pick_another(word):
+    base_ = len(ctx_requests()); pen_write(word, font="futural"); m.pump(1.6)
+    for x in range(80, 300, 12):
+        pen_tap(x, 22)
+        if len(ctx_requests()) > base_ + 1: break
+    m.pump(0.5)
+    return [a_["text"] for n, a_ in ctx_requests()[base_:] if n == "commit_string"]
+before = learned_counts()
+check("a pick the user went back on has taught nothing; the one that stayed is noted once",
+      len(before) == 1 and set(before.values()) == {1} and set(before) <= set(swapped[-1][1].split()), repr(before))
+check("the file with the learnt words is private", os.stat(learned_file).st_mode & 0o777 == 0o600, oct(os.stat(learned_file).st_mode))
+new_field(hint=0x40, purpose=8, serial_=22)
+picked = write_and_pick_another("hello")
+check("password field: another reading can be picked ...", len(picked) == 2 and picked[0] != picked[1], repr(picked))
+check("... but nothing is learnt from it", learned_counts() == before, repr(learned_counts()))
+new_field(serial_=23)
+picked = write_and_pick_another("hello")
+check("the same pick a second time: the word counts from now on",
+      len(picked) == 2 and picked[1] == swapped[-1][1] and set(learned_counts().values()) == {2}, repr((picked, learned_counts())))
 alive = proc.poll() is None
 proc.terminate(); proc.wait(5)
 errlog.seek(0); err = errlog.read()

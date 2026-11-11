@@ -14,7 +14,11 @@ Panel is the conductor.  The parts it conducts:
     devices.InputDevices    mouse, touch and pen -> press / motion / release
     textfield.TextField     the focused text field
     engine.RecognitionWorker  handwriting -> text, on a background thread
+    reader.InkReader        the ink that is waiting, and when it is read
+    gestures                strokes that are commands (scratch out, delete word ...)
     compose                 reading -> typed text (spaces, capitals)
+    history.History         what was typed, to swap or undo it
+    learning.LearnedWords   words picked from the suggestions
     languages.LanguageChoice  the language being written
     fakekeys.FakeKeyboard   copy / cut / paste
     ui.View                 layout and painting; keys.KEYS says which keys exist
@@ -33,17 +37,21 @@ import time
 from PyQt6.QtCore import QPointF
 from PyQt6.QtGui import QPainter
 
-from . import control, kwin
-from .compose import Context, compose, compose_symbol
+from . import control, gestures, kwin
+from .compose import Context, compose, compose_symbol, mid_sentence, unfinished_word
 from .compositor import NotInputMethod, Session
 from .config import Config, Theme, load_state, load_words, save_state
 from .devices import InputDevices, is_touch, source_kind
 from .engine import RecognitionWorker
 from .eventloop import Loop
 from .fakekeys import FakeKeyboard
-from .ink import LineScale, Stroke, ink_bounds, render_line
+from .history import History, Insertion
+from .ink import Stroke
 from .keys import COMMAND, KEY, KEYSYM, SHORTCUT, TEXT
 from .languages import ALL, LanguageChoice
+from .learning import LearnedWords
+from .reader import InkReader
+from .recognizer import Hint
 from .surface import PanelSurface
 from .textfield import PreviewField, TextField, last_word_length
 from .ui import ALL_LANGUAGES, LANGUAGE, LANGUAGES, MORE_LANGUAGES, SYMBOL, SYMBOLS, WRITE, View
@@ -57,23 +65,12 @@ REPEAT_DELAY = 0.45
 REPEAT_INTERVAL = 0.07
 SHOW_COMMAND_WINDOW = 1.0            # see show_now()
 DISPLAY_CHECK_DELAY = 0.5            # see _insist_on_being_displayed()
+# the keys that the gestures of an empty writing area stand for
+GESTURE_KEYS = {gestures.DELETE_WORD: "delword", gestures.SPACE: "space", gestures.ENTER: "enter"}
 FOCUS_THEFT_WINDOW = 0.15       # see _focus_was_stolen()
 # KWin 5 reports touch positions like pointer positions (see PanelSurface.drag);
 # only the test-suite, which runs against KWin 5, sets this.
 KWIN5_TOUCH_DRAG = os.environ.get("KRITZEL_TOUCH_DRAG") == "relative"
-
-
-class Insertion:
-    """The text the panel typed last, so that it can be swapped or undone."""
-
-    def __init__(self, span: str, own_length: int, context: Context, trailing_space: bool):
-        self.span = span                    # the text before the cursor that a swap replaces
-        self.own_length = own_length        # how much of it this insertion typed; the rest is
-        #                                     the automatic space of the insertion before
-        self.context = context              # the text field before it; another reading is
-        #                                     composed for the same situation
-        self.trailing_space = trailing_space    # it ends with an automatic space
-        self.seen_in_field = False          # the application has reported it back
 
 
 class Panel:
@@ -84,29 +81,30 @@ class Panel:
         self.theme = Theme()
         self.view = View(self.theme, cfg)
 
-        # -- what the view paints (see ui.View.paint) --
-        self.strokes: list[Stroke] = []         # finished strokes not yet recognised
+        # -- what the view paints (see ui.View.paint, and the properties below) --
         self.candidates: list[str] = []         # suggestion chips
         self.selected = -1                      # index of the chip that is in the text field
-        self.status = ""                        # short message at the right of the bar
+        self.message = ""                       # short message at the right of the bar
         self.pressed = None                     # name of the key held down
-        self.hint = "Write here"
-
-        # -- ink and recognition --
-        self.current: Stroke | None = None      # the stroke being drawn
-        self._linescale_area = (self.view.canvas.top(), self.view.canvas.height())
-        self.linescale = LineScale(*self._linescale_area)
-        self.generation = 0                     # bumped whenever the ink changes
-        self.recognizing = False
-        self.last: Insertion | None = None
-        self.after_recognition: list = []       # actions waiting for pending ink to be typed
+        self._field_kind_shown = None           # (hint, secret) as last painted
 
         # -- gesture in progress: (source, kind, data); kind is one of
         #    "draw", "erase", "button", "chip", "move" --
         self.gesture = None
-
-        self.languages = LanguageChoice(cfg)    # which dictionary judges the readings
+        self.current: Stroke | None = None      # the stroke being drawn
         self.settings_window = None             # the settings program, while we started it
+
+        # -- ink and what becomes of it --
+        self.languages = LanguageChoice(cfg)    # which dictionary judges the readings
+        self.learned = LearnedWords()
+        self.worker = RecognitionWorker(cfg, self.loop, self._on_model_ready, self._on_model_error,
+                                        lambda *result: self.ink.on_result(*result),
+                                        languages=self.languages.active(), personal=self._personal_words())
+        self.ink = InkReader(self.loop, self.worker, cfg, hint=self._hint, on_reading=self._type_reading,
+                             on_change=self._on_ink_change, remember_pause=not window_mode)
+        self._fit_linescale()
+        self.after_recognition: list = []       # actions waiting for pending ink to be typed
+        self.history = History()                # what was typed, newest last
 
         # -- visibility --
         self.user_hidden = False                # the hide button was pressed
@@ -127,8 +125,6 @@ class Panel:
             on_float_lost=self._on_float_lost, on_gone=self._on_surface_gone)
         self.devices = InputDevices(self.session, sink=self, writing_area=self.view.in_canvas, cfg=cfg)
         self.fake_keyboard = FakeKeyboard(self.session)
-        self.worker = RecognitionWorker(cfg, self.loop, self._on_model_ready, self._on_model_error, self._on_result,
-                                        languages=self.languages.active(), personal=load_words())
         # the commands of keys.KEYS (action kind COMMAND)
         self._commands = {"delete_word": self._delete_word, "language": self._language_key,
                           "symbols": self._symbols_key, "keyboard": self._switch_keyboard,
@@ -140,10 +136,40 @@ class Panel:
             im.dispatcher["deactivate"] = self._on_deactivate
         self._update_visibility()
 
+    # -- more of what the view paints --
+
     @property
     def preview(self):
         """Try-out window: the text that would have been typed."""
         return self.field.text if self.window_mode else None
+
+    @property
+    def strokes(self) -> list[Stroke]:
+        """Finished strokes that are not typed yet."""
+        return self.ink.strokes
+
+    @property
+    def pending(self) -> str:
+        """The reading that is about to be typed."""
+        return self.ink.pending
+
+    @property
+    def status(self) -> str:
+        return self.message or ("…" if self.ink.waiting else "")
+
+    @property
+    def last(self) -> Insertion | None:
+        """The insertion the suggestions belong to."""
+        return self.history.last
+
+    @property
+    def hint(self) -> str:
+        return "Write here" if self._only_characters() is None else "Write digits"
+
+    @property
+    def secret(self) -> bool:
+        """What is written must not be readable on the panel."""
+        return self.field.secret
 
     # ------------------------------------------------------------------
     # Running
@@ -193,9 +219,11 @@ class Panel:
         self._show_page(WRITE)
         self.devices.configure(cfg)
         self.languages.update(cfg)
-        self.worker.configure(cfg, self.languages.active(), load_words())
+        self.ink.configure(cfg)
+        self.learned.load()                 # the settings window may have removed words
+        self.worker.configure(cfg, self.languages.active(), self._personal_words())
         if self.worker.ready:
-            self.status = ""
+            self.message = ""
         self.surface.apply_config(cfg)
         if self.surface.floating and not self.view.has_key("float"):
             self._toggle_float()            # the key that would dock it again is gone
@@ -210,6 +238,7 @@ class Panel:
         self.surface.redraw()
 
     def _paint(self, p: QPainter):
+        self._field_kind_shown = (self.hint, self.secret)
         self.view.paint(p, self)
         if self.current is not None:
             p.setPen(self.view.ink_pen())
@@ -221,12 +250,9 @@ class Panel:
         self._fit_linescale()
 
     def _fit_linescale(self):
-        """The writing area moved or changed its height: what was learnt
-        about the user's line no longer applies."""
-        area = (self.view.canvas.top(), self.view.canvas.height())
-        if self.view.page == WRITE and area != self._linescale_area and not self.strokes:
-            self._linescale_area = area
-            self.linescale.reset(*area)
+        """The writing area may have moved or changed its height."""
+        if self.view.page == WRITE:
+            self.ink.fit(self.view.canvas.top(), self.view.canvas.height())
 
     # ------------------------------------------------------------------
     # Visibility
@@ -328,6 +354,8 @@ class Panel:
 
     def _field_state_changed(self):
         self._check_last_insertion()
+        if (self.hint, self.secret) != self._field_kind_shown:
+            self.redraw()                   # the panel shows what kind of field it is
         # The application re-sent its state, which it also does when the
         # field is tapped again: a floating panel that is not shown asks anew.
         if (self.surface.floating and self.field.active and not self.float_allowed and not self.user_hidden
@@ -339,10 +367,10 @@ class Panel:
 
     def _toggle_float(self):
         if self.window_mode:
-            self.status = "only in the real panel"
+            self.message = "only in the real panel"
             return
         if not self.surface.floating and (self.float_broken or not self.surface.can_float):
-            self.status = "floating is not supported here"
+            self.message = "floating is not supported here"
             return
         self._clear_ink()
         floating = not self.surface.floating
@@ -383,7 +411,7 @@ class Panel:
     def _on_float_lost(self, _reason: str):
         self._clear_ink()
         self.view.floating = False
-        self.status = "floating failed – docked again"
+        self.message = "floating failed – docked again"
         self._remember_floating()
         self._show_docked_again()
         self.redraw()
@@ -438,8 +466,7 @@ class Panel:
             return
         if not self.view.in_canvas(x, y):
             return
-        self.loop.cancel_timer("recognize")
-        self.generation += 1
+        self.ink.begin(erasing=eraser)
         if eraser:
             self.gesture = (source, "erase", None)
             self._erase(x, y)
@@ -477,12 +504,12 @@ class Panel:
         self.gesture = None
         if kind == "draw":
             stroke, self.current = self.current, None
-            if stroke and stroke.points:
-                self.strokes.append(stroke)
+            if stroke and stroke.points and not self._do_gesture(stroke):
+                self.ink.add(stroke)
             self.redraw()
-            self._schedule_recognition()
+            self.ink.end()
         elif kind == "erase":
-            self._schedule_recognition()
+            self.ink.end()
         elif kind == "move":
             self.surface.end_drag()
             self._remember_floating()
@@ -500,6 +527,8 @@ class Panel:
 
     def cancel(self):
         """Abandon the gesture in progress (touch cancelled, panel hidden)."""
+        if self.gesture is not None and self.gesture[1] in ("draw", "erase"):
+            self.ink.end()                  # the ink that was there before is still to be read
         self.gesture = None
         self.current = None
         self.pressed = None
@@ -517,10 +546,31 @@ class Panel:
         p.drawLine(QPointF(*a), QPointF(*b))
 
     def _erase(self, x, y):
-        keep = [s for s in self.strokes if not s.near(x, y, ERASER_RADIUS)]
-        if len(keep) != len(self.strokes):
-            self.strokes = keep
+        if self.ink.erase(x, y, ERASER_RADIUS):
             self.redraw()
+
+    def _do_gesture(self, stroke: Stroke) -> bool:
+        """If the stroke is a command (see gestures.py), carries it out and
+        returns True; a stroke that is writing is left alone."""
+        if not self.cfg.gestures:
+            return False
+        canvas = self.view.canvas
+        area = (canvas.left(), canvas.top(), canvas.width(), canvas.height())
+        bounds = [s.bounds() for s in self.strokes]
+        band = self.ink.linescale.height
+        gesture = gestures.classify(stroke.points, area, band, bounds)
+        if gesture is None:
+            return False
+        log.debug("gesture: %s", gesture.kind)
+        if gesture.kind == gestures.SCRATCH:
+            self.ink.strokes = [s for i, s in enumerate(self.strokes) if i not in gesture.strokes]
+        elif gesture.kind == gestures.SPLIT:
+            shifts = gestures.split_shifts(bounds, gesture.x, band, area)
+            for waiting, dx in zip(self.strokes, shifts):
+                waiting.shift(dx)
+        else:
+            self._do_key(GESTURE_KEYS[gesture.kind])
+        return True
 
     @staticmethod
     def _acts_on_press(name: str) -> bool:
@@ -569,9 +619,9 @@ class Panel:
     def _press_shortcut(self, name: str):
         """Copy, cut, paste."""
         if self.window_mode:
-            self.status = "only in the real panel"
+            self.message = "only in the real panel"
         elif not self.fake_keyboard.press(name):
-            self.status = f"{name} is not possible with this KWin"
+            self.message = f"{name} is not possible with this KWin"
         elif name != "copy":
             self.field.changed_behind_our_back()
             self._forget_last()
@@ -615,27 +665,42 @@ class Panel:
         self._language_changed()
 
     def _language_changed(self):
-        self.worker.configure(self.cfg, self.languages.active(), load_words())
+        self._words_changed()
         self._forget_last()
+
+    def _personal_words(self) -> list[str]:
+        """The user's word list and, if wanted, the words learnt from their picks."""
+        return load_words() + (self.learned.words() if self.cfg.learn else [])
+
+    def _words_changed(self):
+        self.worker.configure(self.cfg, self.languages.active(), self._personal_words())
 
     def _delete_word(self):
         """Ink that is not typed yet is thrown away; otherwise the text that
-        was just inserted is removed, otherwise the word before the cursor."""
+        was just inserted is removed, otherwise the word before the cursor.
+
+        Pressed again and again it walks back through what was written:
+        when a whole insertion is gone, the one before it is the newest
+        again and its suggestions return."""
         if self.strokes or self.current is not None:
             self._clear_ink()
             return
-        if self.last is not None:
-            count = self.last.own_length
+        last = self.last
+        word = last_word_length(self.field.before_cursor())
+        # an insertion that was just typed goes as a whole, however many
+        # words it has; one that has come back only if it is that one word
+        whole_insertion = last is not None and (not last.restored or word == last.own_length)
+        self.field.backspace(last.own_length if whole_insertion else word)
+        if whole_insertion:
+            self._show_suggestions_of(self.history.undo())
         else:
-            count = last_word_length(self.field.before_cursor())
-        self._forget_last()
-        self.field.backspace(count)
+            self._forget_last()
 
     def _switch_keyboard(self):
         """Hand over to the normal on-screen keyboard.  KWin stops this
         process as soon as the setting has changed."""
         if self.window_mode:
-            self.status = "only in the real panel"
+            self.message = "only in the real panel"
             return
         from . import switch
 
@@ -645,7 +710,7 @@ class Panel:
             ok, msg = False, str(e)
         log.info("switch keyboard: %s", msg)
         if not ok:
-            self.status = "no other on-screen keyboard installed" if "installed" in msg else "switching failed"
+            self.message = "no other on-screen keyboard installed" if "installed" in msg else "switching failed"
 
     def _open_settings(self, page: str = ""):
         """The settings window is a program of its own (`kritzel settings`)."""
@@ -659,7 +724,7 @@ class Panel:
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError as e:
             log.warning("could not open the settings: %s", e)
-            self.status = "could not open the settings"
+            self.message = "could not open the settings"
 
     @property
     def language_label(self) -> str:
@@ -671,40 +736,28 @@ class Panel:
 
     def _start_worker(self):
         if not self.worker.started:
-            self.status = "loading…"
+            self.message = "loading…"
             self.worker.start()
 
     def _on_model_ready(self):
-        self.status = ""
+        self.message = ""
         self.redraw()
 
     def _on_model_error(self, _message: str, fatal: bool):
-        self.status = ("recognition failed to start" if fatal else "settings not applied") + " – see `kritzel status`"
+        self.message = ("recognition failed to start" if fatal else "settings not applied") + " – see `kritzel status`"
         self.redraw()
 
-    def _schedule_recognition(self):
-        """Recognise once the user has paused writing."""
-        if self.strokes:
-            self.loop.set_timer("recognize", self.cfg.delay_ms / 1000.0, self._recognize)
-        else:
-            self.loop.cancel_timer("recognize")
-            if self.worker.ready:
-                self.status = ""
-            self.redraw()
+    def _only_characters(self):
+        """The characters that can be meant in a number field; None elsewhere."""
+        return self.field.numeric if self.cfg.number_fields else None
 
-    def _recognize(self):
-        if not self.strokes or (self.gesture and self.gesture[1] in ("draw", "erase")):
-            return
-        if not self.worker.ready:
-            self.loop.set_timer("recognize", 0.2, self._recognize)
-            return
-        image = render_line(self.strokes, self.linescale)
-        if image is None:
-            return
-        self.recognizing = True
-        self.status = "…"
-        self.worker.submit(self.generation, image)
-        self.redraw()
+    def _hint(self) -> Hint:
+        """What the text field tells the recogniser about the writing."""
+        characters = self._only_characters()
+        if characters is not None or not self.cfg.context or self.field.plain:
+            return Hint(characters)
+        context = self._context()
+        return Hint(prefix=unfinished_word(context.before), mid_sentence=mid_sentence(context))
 
     def _type_pending_ink_then(self, action) -> bool:
         """If ink is still waiting to be recognised, recognise it now and run
@@ -712,58 +765,47 @@ class Panel:
         if not self.strokes or not self.cfg.auto_insert:
             return False
         self.after_recognition.append(action)
-        self.loop.cancel_timer("recognize")
-        if not self.recognizing:
-            self._recognize()
+        self.ink.read_now()
         return True
 
-    def _on_result(self, generation: int, candidates):
-        self.recognizing = False
-        if generation != self.generation:
-            # the ink changed while it was being recognised
-            drawing = self.gesture is not None
-            if self.after_recognition and self.strokes and not drawing:
-                self._recognize()
-            elif self.strokes and not drawing and not self.loop.has_timer("recognize"):
-                self._schedule_recognition()
-            elif not self.strokes:
-                self.status = ""
-                self.redraw()
-            return
-        self.status = ""
-        texts = [text for text, _confidence in candidates]
+    def _on_ink_change(self):
+        """The reader has something new to show, or ink went away."""
+        if not self.strokes:
+            self._clear_message()
+        self.redraw()
+
+    def _type_reading(self, readings: list[str]):
+        """The pause is over: types what the recogniser made of the ink, or
+        offers it."""
+        self.message = ""
         waiting, self.after_recognition = self.after_recognition, []
-        if not texts:
-            self.status = "not recognised"
-            self._ink_done()
+        if not readings:
+            self.message = "not recognised"
+            self.ink.done()
             self._forget_last()
         elif self.cfg.auto_insert:
-            self.candidates = texts
+            self.candidates = readings
             self._insert(0)
-            self._ink_done()
+            self.ink.done()
         else:
             # manual mode: nothing is typed until a suggestion is tapped
-            self.candidates, self.selected, self.last = texts, -1, None
+            self._forget_last()
+            self.candidates = readings
         for action in waiting:
             action()
         self.redraw()
 
-    def _ink_done(self):
-        bounds = ink_bounds(self.strokes)
-        if bounds:
-            x0, y0, x1, y1 = bounds
-            self.linescale.learn(y0, y1, (x1 - x0) / max(1.0, y1 - y0))
-        self.strokes = []
-        self.generation += 1
-
     def _clear_ink(self):
-        self.strokes = []
         self.current = None
-        self.generation += 1
+        self.ink.clear()
         self.after_recognition.clear()
-        self.loop.cancel_timer("recognize")
+        self._clear_message()
+
+    def _clear_message(self):
+        """Messages stay until the user goes on - except the one that says
+        the model is still being loaded."""
         if self.worker.ready:
-            self.status = ""
+            self.message = ""
 
     # ------------------------------------------------------------------
     # Suggestions
@@ -795,26 +837,49 @@ class Panel:
         context = self._context()
         typed = self._compose(self.candidates[index], context)
         span = self._type(typed, context)
-        self.last = Insertion(span, len(typed.text), context, typed.trailing_space)
+        self.history.add(Insertion(span, len(typed.text), context, typed.trailing_space,
+                                   self.candidates, index, typed.eats_space))
         self.selected = index
 
     def _choose(self, index: int):
         """A suggestion chip was tapped."""
         if not 0 <= index < len(self.candidates):
             return
-        if self.last is None:
+        last = self.last
+        if last is None:
             self._insert(index)             # manual mode
-            self._ink_done()
+            self.ink.done()
         elif index != self.selected:
             # the other reading, composed for the situation the first one met
-            context = self.last.context
+            context = last.context
             typed = self._compose(self.candidates[index], context)
             keeps_space = context.space_pending and not typed.eats_space
             span = (" " if keeps_space else "") + typed.text
-            if self.field.replace(self.last.span, span):
-                self.last = Insertion(span, len(typed.text), context, typed.trailing_space)
+            if self.field.replace(last.span, span):
+                self._learn(last, index)
+                self.history.replace_last(
+                    last.swapped(span, len(typed.text), typed.trailing_space, index, typed.eats_space))
                 self.selected = index
         self.redraw()
+
+    def _learn(self, insertion: Insertion, index: int):
+        """The user picked reading `index` for an insertion: the panel had
+        typed another one by itself and should know better next time.  A pick
+        made before for the same insertion no longer holds.
+
+        Nothing is learnt from fields that hold no prose - what is written
+        there (a password, an address) is not ours to keep."""
+        if not self.cfg.learn or not self.field.prose:
+            return
+        readings, first = insertion.candidates, insertion.typed_first
+        keep_capitals = mid_sentence(insertion.context)
+        changed = False
+        if insertion.selected != first:
+            changed = self.learned.retract(readings[insertion.selected], readings[first], keep_capitals)
+        if index != first:
+            changed = self.learned.note(readings[index], readings[first], keep_capitals) or changed
+        if changed:
+            self._words_changed()
 
     def _check_last_insertion(self):
         """Once the application has shown us our insertion in its text and
@@ -829,6 +894,12 @@ class Panel:
             self._forget_last()
             self.redraw()
 
+    def _show_suggestions_of(self, insertion: Insertion | None):
+        if insertion is None:
+            self.candidates, self.selected = [], -1
+        else:
+            self.candidates, self.selected = insertion.candidates, insertion.selected
+
     def _forget_last(self):
-        self.last = None
-        self.candidates, self.selected = [], -1
+        self.history.clear()
+        self._show_suggestions_of(None)

@@ -16,6 +16,19 @@ import numpy as np
 
 MODEL_HEIGHT = 48          # input height the model was trained with
 MIN_MODEL_WIDTH = 320      # narrower lines are padded up to this width
+CASE_EDGE = 0.05           # by how much the context decides between "Some" and "some"
+
+
+class Hint:
+    """What the text field tells about the writing that is to be read."""
+
+    def __init__(self, characters: str | None = None, prefix: str = "", mid_sentence: bool = False):
+        self.characters = characters    # the only characters that can be meant (a number field); None: any
+        self.prefix = prefix            # the letters right before the cursor: the writing continues that word
+        self.mid_sentence = mid_sentence    # the writing does not start a sentence
+
+
+NO_HINT = Hint()
 
 
 class Recognizer:
@@ -47,6 +60,7 @@ class Recognizer:
             self._script_mask[0] = 1.0
         self.mask = self._script_mask
         self.letters = None
+        self._character_masks: dict[str, np.ndarray] = {}
 
     def set_letters(self, letters):
         """Narrows the output to the alphabet of the language in use: of the
@@ -63,10 +77,24 @@ class Recognizer:
         own = np.array([c in allowed for c in self.chars], dtype=np.float32)
         self.mask = np.maximum(self._script_mask, own) * (1.0 - np.array(foreign, dtype=np.float32))
 
+    def _mask_for(self, characters: str | None):
+        """The mask that leaves only `characters`; the usual one for None."""
+        if characters is None:
+            return self.mask
+        mask = self._character_masks.get(characters)
+        if mask is None:
+            allowed = set(characters)
+            mask = np.array([c in allowed for c in self.chars], dtype=np.float32)
+            mask[0] = 1.0                       # the CTC blank
+            if len(self._character_masks) < 16:     # there are only a few kinds of field
+                self._character_masks[characters] = mask
+        return mask
+
     # -- inference ---------------------------------------------------------
 
-    def probabilities(self, gray: np.ndarray) -> np.ndarray:
+    def probabilities(self, gray: np.ndarray, mask=None) -> np.ndarray:
         """gray: uint8 array (48, W), white paper = 255, ink = 0.
+        mask: 0 for the classes that cannot be meant.
         Returns per-frame class probabilities, shape (T, n_classes)."""
         if gray.shape[0] != MODEL_HEIGHT:
             raise ValueError(f"line image must be {MODEL_HEIGHT}px high")
@@ -81,13 +109,13 @@ class Recognizer:
             raise RuntimeError(
                 f"character table ({len(self.chars)}) does not match model output ({out.shape[1]})"
             )
-        if self.mask is not None:
-            out = out * self.mask[None, :]
+        if mask is not None:
+            out = out * mask[None, :]
         return out
 
-    def recognize(self, gray: np.ndarray, n_best: int = 5) -> list[tuple[str, float]]:
+    def recognize(self, gray: np.ndarray, n_best: int = 5, hint: Hint = NO_HINT) -> list[tuple[str, float]]:
         """Returns up to n_best (text, confidence) pairs, best first."""
-        probs = self.probabilities(gray)
+        probs = self.probabilities(gray, self._mask_for(hint.characters))
         cands = ctc_beam_search(probs, self.chars, beam_width=16, top_k=5, n_best=max(n_best * 3, 8))
         merged: dict[str, float] = {}           # text -> log probability
         for text, logp in cands:
@@ -96,13 +124,19 @@ class Recognizer:
                 merged[text] = max(merged.get(text, -math.inf), logp)
         if not merged:
             return []
-        lexicon = self.lexicon
+        # word lists have nothing to say about numbers
+        lexicon = self.lexicon if hint.characters is None else None
         if lexicon:
             # what the word lists make of the likeliest readings
             for text, logp in sorted(merged.items(), key=lambda kv: -kv[1])[:4]:
-                for other, penalty in lexicon.alternatives(text):
-                    merged[other] = max(merged.get(other, -math.inf), logp - penalty)
-        scored = [(logp + (lexicon.bonus(text) if lexicon else 0.0), logp, text) for text, logp in merged.items()]
+                others = [(other, logp - penalty) for other, penalty in lexicon.alternatives(text, hint.prefix)]
+                small = lexicon.mid_sentence_form(text) if hint.mid_sentence else None
+                if small is not None:
+                    others.append((small, logp + CASE_EDGE))
+                for other, other_logp in others:
+                    merged[other] = max(merged.get(other, -math.inf), other_logp)
+        scored = [(logp + (lexicon.bonus(text, hint.prefix) if lexicon else 0.0), logp, text)
+                  for text, logp in merged.items()]
         scored.sort(reverse=True)
         return [(text, math.exp(min(0.0, logp))) for _, logp, text in scored[:n_best]]
 

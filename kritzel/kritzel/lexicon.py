@@ -9,6 +9,10 @@ terms).  A Lexicon does three things with a reading of the recogniser:
     alternatives()  offers the personal word that is one slip away from what
                     was read ("Kritzal" -> "Kritzel"), and likewise words of
                     the dictionary ("helle" -> "hello" with the English one)
+    mid_sentence_form()  "Some" -> "some" where a capital is unlikely
+
+bonus() and alternatives() take the letters right before the cursor
+(`prefix`): writing that continues a word is judged together with it.
 """
 
 from __future__ import annotations
@@ -24,12 +28,16 @@ EDIT_COST = 1.0             # one wrong, missing or extra letter
 LOOKALIKE_COST = 0.8        # a letter mistaken for one that looks similar in handwriting
 LENGTH_COST = 1.1           # a letter too many or too few
 CORRECTIONS_PER_WORD = 2
+# capitals that look like their small letters, only bigger: the picture of a
+# single word cannot tell them apart
+SAME_SHAPE_CAPITALS = frozenset("CKOPSUVWXZ")
 
 # groups of letters that handwriting recognition mixes up
 _LOOKALIKES = ("aoec", "nuhm", "ilt", "rv", "uvw", "gqy", "ij", "hkb", "cl", "ft", "sz", "dcl", "mw", "äa", "öo", "üu")
 LOOKALIKE = {(a, b) for group in _LOOKALIKES for a in group for b in group if a != b}
 
 _WORD = re.compile(r"[^\W\d_]{2,}", re.UNICODE)
+_LETTERS = re.compile(r"[^\W\d_]+", re.UNICODE)
 # Dictionaries list base forms; these endings make a rough guess at inflected
 # ones.  Languages without an entry get all of them.
 _SUFFIXES = {
@@ -96,13 +104,18 @@ def _dictionary_encoding(path: str) -> str:
     return "utf-8"
 
 
+def _capitalises_nouns(path: str) -> bool:
+    """German writes every noun with a capital."""
+    return os.path.basename(path).lower().startswith("de")
+
+
 def _read_dictionary(path: str) -> frozenset:
     if path in _files:
         return _files[path]
-    # German writes every noun with a capital, and the recogniser often
-    # misses capitals: there "haus" has to count as "Haus".  Elsewhere a
-    # capitalised entry is a name, and "helle" is not "Helle".
-    fold_case = os.path.basename(path).lower().startswith("de")
+    # The recogniser often misses capitals: in German "haus" has to count
+    # as "Haus".  Elsewhere a capitalised entry is a name, and "helle" is
+    # not "Helle".
+    fold_case = _capitalises_nouns(path)
     words = set()
     try:
         with open(path, "r", encoding=_dictionary_encoding(path), errors="ignore") as f:
@@ -162,6 +175,7 @@ class Lexicon:
         elif sets:
             self.words = frozenset().union(*sets)
         self.letters = "".join(sorted(set("".join(_letters.get(path, "") for path in self.loaded))))
+        self.capitalises_nouns = any(_capitalises_nouns(path) for path in self.loaded)
         self.personal: dict[str, str] = {}      # lower case -> as the user spells it
         for word in personal:
             word = word.strip()
@@ -176,24 +190,33 @@ class Lexicon:
     def is_personal(self, word: str) -> bool:
         return word.lower() in self.personal
 
-    def known(self, word: str) -> bool:
-        if self.is_personal(word):
+    def _listed(self, word: str) -> bool:
+        """The word as it is written, or its base form, is in a dictionary."""
+        if word in self.words:
             return True
-        for w in (word, word.lower()):
-            if w in self.words:
-                return True
-            for suffix in self.suffixes:
-                if len(w) > len(suffix) + 2 and w.endswith(suffix) and w[: -len(suffix)] in self.words:
-                    return True
-        return False
+        return any(len(word) > len(suffix) + 2 and word.endswith(suffix) and word[: -len(suffix)] in self.words
+                   for suffix in self.suffixes)
 
-    def bonus(self, text: str) -> float:
+    def known(self, word: str) -> bool:
+        return self.is_personal(word) or self._listed(word) or self._listed(word.lower())
+
+    @staticmethod
+    def _continued_word(text: str, prefix: str):
+        """With letters right before the cursor (`prefix`), writing that
+        starts with letters continues that word.  Returns (the whole word,
+        where it ends in `text`), or None if no word is continued."""
+        head = _LETTERS.match(text) if prefix else None
+        return (prefix + head.group(0), head.end()) if head else None
+
+    def bonus(self, text: str, prefix: str = "") -> float:
         """Score adjustment in log-probability units: every word that is in
         none of the dictionaries costs `weight`, every personal word earns a
         little.  Splitting or joining words is never rewarded, so the picture
         of the ink still decides."""
+        continued = self._continued_word(text, prefix)
+        words = _WORD.findall(text[continued[1]:]) + [continued[0]] if continued else _WORD.findall(text)
         score = 0.0
-        for word in _WORD.findall(text):
+        for word in words:
             spelling = self.personal.get(word.lower())
             if spelling is not None:
                 # "kwin" is fine, but the user's own "KWin" is better
@@ -286,10 +309,39 @@ class Lexicon:
             return 0.5 * self.weight * cost
         return self.weight + 0.2 + 0.1 * cost
 
-    def alternatives(self, text: str) -> list[tuple[str, float]]:
+    def alternatives(self, text: str, prefix: str = "") -> list[tuple[str, float]]:
         """Other readings of `text` that the word lists suggest, as
         (text, penalty): near misses of personal words always, of dictionary
         words if corrections are on."""
+        continued = self._continued_word(text, prefix)
+        if continued is None:
+            return self._alternatives(text)
+        # the end of a word: corrected as part of that word, and only its own letters
+        whole, end = continued
+        result = [(text[:end] + other, penalty) for other, penalty in self._alternatives(text[end:])]
+        if self.corrections != "off":
+            for fixed, cost in self._nearest_dictionary_words(whole):
+                if len(fixed) > len(prefix) and fixed[: len(prefix)].lower() == prefix.lower():
+                    result.append((fixed[len(prefix):] + text[end:], self._correction_penalty(cost)))
+                    break
+        return result
+
+    def mid_sentence_form(self, text: str):
+        """`text` with a small first letter, if that is the likelier reading
+        in the middle of a sentence: the capital looks like its small letter
+        ("Some" / "some"), the word is known in small letters and is not a
+        name.  None otherwise - and always where nouns have capitals."""
+        first = _WORD.match(text)
+        if first is None or self.capitalises_nouns or not self.words:
+            return None
+        word = first.group(0)
+        if word[0] not in SAME_SHAPE_CAPITALS or not word[1:].islower():
+            return None
+        if self.is_personal(word) or self._listed(word) or not self._listed(word.lower()):
+            return None
+        return word[0].lower() + text[1:]
+
+    def _alternatives(self, text: str) -> list[tuple[str, float]]:
         result = []
         personal = self.personalise(text)
         if personal is not None:
